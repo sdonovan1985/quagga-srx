@@ -21,6 +21,10 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 #ifndef _QUAGGA_BGP_ATTR_H
 #define _QUAGGA_BGP_ATTR_H
 
+#ifdef USE_SRX
+#include <srx/srxcryptoapi.h>
+#endif // USE_SRX
+
 /* Simple bit mapping. */
 #define BITMAP_NBBY 8
 
@@ -94,7 +98,6 @@ struct attr_extra
   uint16_t			encap_tunneltype;	/* grr */
   struct bgp_attr_encap_subtlv *encap_subtlvs;		/* rfc5512 */
 };
-
 /* BGP core attribute structure. */
 struct attr
 {
@@ -120,6 +123,12 @@ struct attr
   
   /* Path origin attribute */
   u_char origin;
+
+#ifdef USE_SRX
+  struct BgpsecPathAttr *bgpsecPathAttr;
+  
+  SCA_BGPSecValidationData* bgpsec_validationData;
+#endif
 };
 
 /* Router Reflector related structure. */
@@ -167,11 +176,15 @@ extern struct attr *bgp_attr_default_intern (u_char);
 extern struct attr *bgp_attr_aggregate_intern (struct bgp *, u_char,
                                         struct aspath *, 
                                         struct community *, int as_set);
+#ifdef USE_SRX
+// Added the OUT parameter fSetAspath which will be returned true if the
+// path was send as AS_PATH and false if the path was send as BGPSEC path.
+#endif
 extern bgp_size_t bgp_packet_attribute (struct bgp *bgp, struct peer *,
 					struct stream *, struct attr *,
 					struct prefix *, afi_t, safi_t,
 					struct peer *, struct prefix_rd *,
-					u_char *);
+					u_char *, bool* fSetAspath);
 extern void bgp_dump_routes_attr (struct stream *, struct attr *,
 				  struct prefix *);
 extern int attrhash_cmp (const void *, const void *);

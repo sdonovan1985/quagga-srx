@@ -19,6 +19,9 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 02111-1307, USA.  */
 
 #include <zebra.h>
+#ifdef USE_SRX
+#include <srx/srxcryptoapi.h>
+#endif
 
 #include "thread.h"
 #include "stream.h"
@@ -140,6 +143,58 @@ bgp_connect_check (struct peer *peer)
     }
 }
 
+#ifdef USE_SRX
+struct ecommunity* srxEcommunityChange(struct bgp *bgp, struct attr *attr, struct bgp_info *binfo)
+{
+  struct attr_extra *attre = attr->extra;
+  struct ecommunity *ecom=NULL, *ecom_orig=NULL;
+  unsigned int state;
+
+  switch(binfo->val_res_ROA)
+  {
+    case ECOMMUNITY_BGPSEC_VALID:
+      state = ECOMMUNITY_BGPSEC_VALID; break;
+    case ECOMMUNITY_BGPSEC_NOT_FOUND:
+      state = ECOMMUNITY_BGPSEC_NOT_FOUND; break;
+    case ECOMMUNITY_BGPSEC_INVALID:
+      state = ECOMMUNITY_BGPSEC_INVALID; break;
+    default:
+      state = ECOMMUNITY_BGPSEC_NOT_FOUND; break;
+  }
+
+  if(attre)
+  {
+    ecom = ecommunity_bgpsec_str2com (bgp->srx_ecommunity_subcode, state);
+    attr->flag |= ATTR_FLAG_BIT (BGP_ATTR_EXT_COMMUNITIES);
+    ecom_orig = attre->ecommunity;
+    attre->ecommunity = ecom;
+  }
+  else
+    return NULL;
+
+  return ecom_orig;
+}
+
+int srxEcommunityRestore(struct attr *attr, struct ecommunity* ecom_orig)
+{
+  struct attr_extra *attre = attr->extra;
+  struct ecommunity *ecom=NULL;
+  int ret=0;
+
+  if(attre && attre->ecommunity && (attr->flag & ATTR_FLAG_BIT (BGP_ATTR_EXT_COMMUNITIES)))
+  {
+    attr->flag &= ~(ATTR_FLAG_BIT (BGP_ATTR_EXT_COMMUNITIES));
+    ecom = attre->ecommunity;
+    attre->ecommunity = ecom_orig;
+    ret = 1;
+  }
+
+  if(ecom)
+    free(ecom);
+
+  return ret;
+}
+#endif
 /* Make BGP update packet.  */
 static struct stream *
 bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
@@ -155,6 +210,9 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
   unsigned long attrlen_pos = 0;
   size_t mpattrlen_pos = 0;
   size_t mpattr_pos = 0;
+#ifdef USE_SRX
+  u_char bFrag =0;
+#endif
 
   s = peer->work;
   stream_reset (s);
@@ -171,18 +229,30 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
       if (adv->binfo)
         binfo = adv->binfo;
 
+#ifdef USE_SRX
+    if (BGP_DEBUG (bgpsec, BGPSEC_DETAIL))
+      zlog_debug("[BGPSEC] [%s] stream remain:%d prefix size: %d rn->p:%08x attr:%p ",
+                 __FUNCTION__, STREAM_REMAIN (s),  PSIZE (rn->p.prefixlen),
+                 rn->p.u.prefix4, adv->baa->attr);
+#endif
       /* When remaining space can't include NLRI and it's length.  */
       if (STREAM_CONCAT_REMAIN (s, snlri, STREAM_SIZE(s)) <=
 	  (BGP_NLRI_LENGTH + bgp_packet_mpattr_prefix_size(afi,safi,&rn->p)))
 	break;
 
+#ifdef USE_SRX
+    // By default we assume the update will be send out using BGPSEC. the
+    // function bgp_packer_attribute will do the final decision and return
+    // the final result back. For now we assume we do BGPSEC and NOT AS_PATH
+    bool useASpath = false;
+#endif
       /* If packet is empty, set attribute. */
       if (stream_empty (s))
 	{
 	  struct prefix_rd *prd = NULL;
 	  u_char *tag = NULL;
 	  struct peer *from = NULL;
-
+	  
 	  if (rn->prn)
 	    prd = (struct prefix_rd *) &rn->prn->p;
           if (binfo)
@@ -191,14 +261,14 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
               if (binfo->extra)
                 tag = binfo->extra->tag;
             }
-
+          
 	  /* 1: Write the BGP message header - 16 bytes marker, 2 bytes length,
 	   * one byte message type.
 	   */
 	  bgp_packet_set_marker (s, BGP_MSG_UPDATE);
 
 	  /* 2: withdrawn routes length */
-	  stream_putw (s, 0);
+      stream_putw (s, 0);
 
 	  /* 3: total attributes length - attrlen_pos stores the position */
 	  attrlen_pos = stream_get_endp (s);
@@ -211,13 +281,39 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
 	  mpattr_pos = stream_get_endp(s);
 
 	  /* 5: Encode all the attributes, except MP_REACH_NLRI attr. */
-	  total_attr_len = bgp_packet_attribute (NULL, peer, s,
-	                                         adv->baa->attr,
-                                                 ((afi == AFI_IP && safi == SAFI_UNICAST) ?
-                                                  &rn->p : NULL),
-                                                 afi, safi,
-	                                         from, prd, tag);
-	}
+#ifdef USE_SRX
+      struct ecommunity *ecom_orig;
+      if (CHECK_FLAG (peer->bgp->srx_ecommunity_flags,  SRX_BGP_FLAG_ECOMMUNITY))
+        ecom_orig = srxEcommunityChange(peer->bgp, adv->baa->attr, binfo);
+      total_attr_len = bgp_packet_attribute (NULL, peer, s,
+                                             adv->baa->attr,
+                                             ((afi == AFI_IP && safi == SAFI_UNICAST) ?
+                                                  &rn->p : NULL), 
+											 afi, safi,
+                                             from, prd, tag, &useASpath);
+#else
+      total_attr_len = bgp_packet_attribute (NULL, peer, s,
+                                             adv->baa->attr,
+                                             ((afi == AFI_IP && safi == SAFI_UNICAST) ?
+                                                  &rn->p : NULL), 
+											 afi, safi,
+                                             from, prd, tag);
+#endif
+      stream_putw_at (s, pos, total_attr_len);
+#ifdef USE_SRX
+      if (CHECK_FLAG (peer->bgp->srx_ecommunity_flags,  SRX_BGP_FLAG_ECOMMUNITY))
+        bFrag = srxEcommunityRestore(adv->baa->attr, ecom_orig);
+#endif
+  	}
+
+#ifdef USE_SRX
+    // @NOTE: The line below does not considder all IBGP situations. In some,
+    // we need to send the prefix (origin) in others we forward the received
+    // one. There we need to use the MP_NLRI.
+    // if ( !CHECK_FLAG (peer->flags, PEER_FLAG_BGPSEC_MPE_IPV4) )
+    if (useASpath)
+    // What this means is only use the prefix list if an as path was written.
+#endif
 
       if (afi == AFI_IP && safi == SAFI_UNICAST)
 	stream_put_prefix (s, &rn->p);
@@ -237,6 +333,7 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
 						    adv->baa->attr);
 	  bgp_packet_mpattr_prefix(snlri, afi, safi, &rn->p, prd, tag);
 	}
+
       if (BGP_DEBUG (update, UPDATE_OUT))
         {
           char buf[INET6_BUFSIZ];
@@ -255,7 +352,94 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
 
       adj->attr = bgp_attr_intern (adv->baa->attr);
 
+#ifdef USE_SRX
+    if (BGP_DEBUG (bgpsec, BGPSEC_DETAIL))
+      zlog_debug("[BGPSEC] [%s] (after intern) adj->attr:%p bgpsec attr:%p ",\
+          __FUNCTION__, adj->attr, adj->attr->bgpsecPathAttr );
+#endif
+
       adv = bgp_advertise_clean (peer, adj, afi, safi);
+#ifdef USE_SRX
+    if ( CHECK_FLAG (peer->flags, PEER_FLAG_BGPSEC_MPE_IPV4) )
+      break;
+
+    struct peer *from = NULL;
+    u_char bDoNotFrag =0;
+    if (binfo)
+    {
+      from = binfo->peer;
+      if (from)
+      {
+        /* if and only if, the peer's recv capability set and this node's send capability set,
+         * BGPSec Update message can be sent to the peer */
+        if( (CHECK_FLAG (peer->flags, PEER_FLAG_BGPSEC_CAPABILITY_SEND) \
+              && CHECK_FLAG (peer->cap, PEER_CAP_BGPSEC_ADV)) )
+        {
+          /* debug */
+          if (BGP_DEBUG (bgpsec, BGPSEC_DETAIL))
+          {
+            zlog_debug("[BGPSEC] from:%p from->as:%d from->cap:%04x",
+                       from, from->as, from->cap);
+          }
+
+          /* in case, when the previous(from) node sends to the current node which is connected
+           * to the next node(peer), to determine whether to send BGPSec or BGPv4 */
+          if (from->as >0 && from->as != peer->as)
+          {
+            if (!CHECK_FLAG (from->cap, PEER_CAP_BGPSEC_ADV_SEND)
+                || !CHECK_FLAG (from->flags, PEER_FLAG_BGPSEC_CAPABILITY_RECV))
+            {
+              bDoNotFrag =1;   // fragmentation set
+            }
+          }
+        }
+      }
+    }
+
+    /*
+     * only if bgpsec enabled and the from-peer has joined the bgpsec
+     * or in case of sending ecommunity string to its peer
+     */
+    if (   (CHECK_FLAG (peer->flags, PEER_FLAG_BGPSEC_CAPABILITY_SEND)
+            && CHECK_FLAG (peer->cap, PEER_CAP_BGPSEC_ADV))
+        || ((CHECK_FLAG (peer->bgp->srx_ecommunity_flags, SRX_BGP_FLAG_ECOMMUNITY))
+            && bFrag && from))
+    {
+// @NOTE: This will be redone in the next run through.
+      if (bDoNotFrag)
+        goto donot_frag;
+
+      /* in case, received BGPv4 Update from the previous node of the previous peer or more preivou in turn.
+       * If 'aspath->segments' exists, it means 'attr' comes from the peer node
+       * If 'attr->bgpsecPathAttr' NOT exists, it means attr doesn't include BGPSec Update
+       * */
+// @NOTE: This will be redone in the next run through.
+      if (adj->attr->aspath && adj->attr->aspath->segments &&
+          adj->attr->aspath->segments->length > 0 && !adj->attr->bgpsecPathAttr)
+        goto donot_frag;
+
+      size_t cp = stream_get_getp(s);
+      stream_set_getp (s, BGP_MARKER_SIZE + 2);
+      u_char type = stream_getc (s);
+      stream_set_getp(s, cp); // rewind
+
+      /* BGP_UPDATE fragmentation */
+      if (type == BGP_MSG_UPDATE)
+      {
+        bgp_packet_set_size (s);
+        packet = stream_dup (s);
+        bgp_packet_add (peer, packet);
+        if (BGP_DEBUG (bgpsec, BGPSEC_DETAIL))
+          zlog_debug("*** Update Message Fragmentation ON (to peer:%d)*** ", peer->as);
+        BGP_WRITE_ON (peer->t_write, bgp_write, peer->fd);
+        stream_reset (s);
+        return packet;
+      }
+    }
+// @NOTE: This will be redone in the next run through.
+donot_frag:
+    bDoNotFrag = 0;
+#endif /* USE-SRX */
     }
 
   if (! stream_empty (s))
@@ -265,7 +449,7 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
 	  bgp_packet_mpattr_end(snlri, mpattrlen_pos);
 	  total_attr_len += stream_get_endp(snlri);
 	}
-
+    }//FIXME: should this be here?
       /* set the total attribute length correctly */
       stream_putw_at (s, attrlen_pos, total_attr_len);
 
@@ -357,7 +541,7 @@ bgp_withdraw_packet (struct peer *peer, afi_t afi, safi_t safi)
       adj = adv->adj;
       rn = adv->rn;
 
-      if (STREAM_REMAIN (s)
+      if (STREAM_REMAIN (s) 
 	  < (BGP_NLRI_LENGTH + BGP_TOTAL_ATTR_LEN + PSIZE (rn->p.prefixlen)))
 	break;
 
@@ -374,7 +558,7 @@ bgp_withdraw_packet (struct peer *peer, afi_t afi, safi_t safi)
       else
 	{
 	  struct prefix_rd *prd = NULL;
-
+	  
 	  if (rn->prn)
 	    prd = (struct prefix_rd *) &rn->prn->p;
 
@@ -411,7 +595,7 @@ bgp_withdraw_packet (struct peer *peer, afi_t afi, safi_t safi)
     {
       if (afi == AFI_IP && safi == SAFI_UNICAST)
 	{
-	  unfeasible_len
+	  unfeasible_len 
 	    = stream_get_endp (s) - BGP_HEADER_SIZE - BGP_UNFEASIBLE_LEN;
 	  stream_putw_at (s, BGP_HEADER_SIZE, unfeasible_len);
 	  stream_putw (s, 0);
@@ -476,11 +660,20 @@ bgp_default_update_send (struct peer *peer, struct attr *attr,
   /* Make place for total attribute length.  */
   pos = stream_get_endp (s);
   stream_putw (s, 0);
+#ifdef USE_SRX
+  bool fUsedAspath = false;
+  total_attr_len = bgp_packet_attribute (NULL, peer, s, attr, &p, afi, safi, 
+                                         from, NULL, NULL, &fUsedAspath);
+#else
   total_attr_len = bgp_packet_attribute (NULL, peer, s, attr, &p, afi, safi, from, NULL, NULL);
+#endif
 
   /* Set Total Path Attribute Length. */
   stream_putw_at (s, pos, total_attr_len);
 
+#ifdef USE_SRX
+  if (fUsedAspath)
+#endif
   /* NLRI set. */
   if (p.family == AF_INET && safi == SAFI_UNICAST)
     stream_put_prefix (s, &p);
@@ -736,6 +929,14 @@ bgp_write (struct thread *thread)
 	  break;
 	case BGP_MSG_UPDATE:
 	  peer->update_out++;
+#ifdef USE_SRX
+          sockopt_cork (peer->fd, 0);
+          if (BGP_DEBUG (bgpsec, BGPSEC_DETAIL))
+            zlog_debug("[BGPSEC] update packet couter: %d", count);
+          //
+          // TODO: considering 'count' option if update  msg exceeds the bound
+          //
+#endif
 	  break;
 	case BGP_MSG_NOTIFY:
 	  peer->notify_out++;
@@ -2605,3 +2806,19 @@ bgp_read (struct thread *thread)
     }
   return 0;
 }
+#ifdef USE_SRX
+int bgp_read2 (struct thread *thread)
+{
+
+  struct peer *peer;
+
+  /* Yes first of all get peer pointer. */
+  peer = THREAD_ARG (thread);
+  peer->t_read = NULL;
+
+
+    zlog_debug(" event read2 ---------\n");
+    BGP_READ_ON (peer->t_read, bgp_read2, peer->fd);
+    return 0;
+}
+#endif /* USE_SRX */

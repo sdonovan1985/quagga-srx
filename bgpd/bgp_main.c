@@ -470,7 +470,11 @@ main (int argc, char **argv)
   vty_serv_sock (vty_addr, vty_port, BGP_VTYSH_PATH);
 
   /* Print banner. */
+#ifdef USE_SRX
+  zlog_notice ("BGPd (+SRx) %s starting: vty@%d, bgp@%s:%d pid %d", QUAGGA_VERSION,
+#else /* USE_SRX */
   zlog_notice ("BGPd %s starting: vty@%d, bgp@%s:%d pid %d", QUAGGA_VERSION,
+#endif /* USE_SRX */
 	       vty_port, 
 	       (bm->address ? bm->address : "<all>"),
 	       bm->port,

@@ -56,9 +56,307 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_mpath.h"
 
+#ifdef USE_SRX
+#include <sys/un.h>
+#include "srx/srx_defs.h"
+#include "srx/srx_api.h"
+#include "bgpd/bgp_validate.h"
+#endif /* USE_SRX */
+
 /* Extern from bgp_dump.c */
 extern const char *bgp_origin_str[];
 extern const char *bgp_origin_long_str[];
+
+#ifdef USE_SRX
+#define NUM_MAX_RECONNECT   2
+#define RETRY_TIMER_SEC     10
+
+extern bool handleSRxValidationResult (SRxValidationResult* result,
+                                       void* bgpRouter);
+extern void handleSRxSignatures(SRxUpdateID* updateID, BGPSecData* data,
+                                void* bgpRouter);
+extern void handleSRxSynchRequest(void* bgpRouter);
+int respawnReceivePacket(struct thread *t);
+struct thread *g_current_read_thread;
+
+struct SRxThread* srx_thread_arg_new(void)
+{
+    struct SRxThread *rq;
+    rq = calloc(1, sizeof(struct SRxThread));
+
+    return rq;
+}
+
+int checkClientConnection(struct thread *t)
+{
+    zlog_debug (" %s called", __FUNCTION__);
+    struct thread *thr=NULL;
+    //bool succ;
+    struct SRxThread *rq;
+    bool reconnected = false;
+    static int siMaxReconnect = 0;
+
+    rq = (struct SRxThread *)THREAD_ARG(t);
+    rq->t_read = NULL;
+
+    // Get the bgp instance
+    struct bgp* bgp = bgp_get_default();
+    // Only the previous FD is needed, it contains the original FD that needs
+    // to be closed
+    int prevClientFD = getInternalSocketFD(bgp->srxProxy, false);
+    zlog_debug (" obtained previous fd:%d,  rq->clientFD:%d", prevClientFD,
+                rq->clientFD);
+
+    rq->prevClientFD = (rq->clientFD >0) ? rq->clientFD : prevClientFD ;
+
+    // Reconnect session. In this case it only closes the old connection on the
+    // application layer. The socket is not closed - we will do this later on
+    reconnected = reconnectWithSRx(bgp->srxProxy);
+
+    if(thr)
+    {
+      zlog_debug ("[%s] cancel the previous thread (fd:%d,%d)", __FUNCTION__,
+                  rq->clientFD, thr->u.fd);
+      thread_cancel(thr);
+    }
+
+    // Cancel old timer threads
+    if(reconnected)
+    {
+      zlog_debug (" close previous socket FD(%d)", rq->prevClientFD);
+      close(rq->prevClientFD);
+
+      // new fd
+      rq->clientFD = getInternalSocketFD(bgp->srxProxy, true);
+      rq->t_read = thr = thread_add_read (bm->master, respawnReceivePacket, rq,
+                                          rq->clientFD);
+      g_current_read_thread = thr;
+      zlog_debug ("[%s] call thread-add-read again for the new fd:%d",
+                  __FUNCTION__, rq->clientFD);
+      return 0;
+    }
+    else
+    {
+      // respawn in every 10 sec
+      thr = thread_add_timer (bm->master, checkClientConnection, rq,
+                              RETRY_TIMER_SEC ); // every 10 sec, try again
+    }
+
+    // TODO: if a certain amount times fail for reconnect, then clear off
+    //       client connection
+    siMaxReconnect++;
+    if(siMaxReconnect >= NUM_MAX_RECONNECT )
+    {
+      // Close the previous FD
+      if(rq->prevClientFD > 0)
+      {
+        zlog_debug (" close previous socket prevFD(%d)", rq->prevClientFD);
+        close(rq->prevClientFD);
+      }
+
+      bgp= bgp_get_default();
+      if (bgp == NULL)
+      {
+        return 0;
+      }
+
+      zlog_debug (" srx unset() bgp info hash finish() and releaseSRxProxy()");
+      bgp_srx_unset(bgp);
+      siMaxReconnect =0;
+      //bgp_info_hash_finish (&bgp->info_hash);
+      if (bgp->srxProxy)
+      {
+        releaseSRxProxy (bgp->srxProxy);
+      }
+      if(thr)
+      {
+        thread_cancel(thr);
+      }
+
+      // Close the previous thread FD
+      if(rq->clientFD > 0)
+      {
+        zlog_debug (" close previous socket rq->clientFD(%d)", rq->clientFD);
+        close(rq->clientFD);
+      }
+
+      zlog_debug (" srx set default again");
+      srx_set_default(bgp);
+    }
+
+    return 0;
+}
+
+int respawnReceivePacket(struct thread *t)
+{
+    //zlog_debug("respawnReceivePacket called");
+    struct SRxThread *rq;
+    bool bRetVal = true;
+    rq = (struct SRxThread *)THREAD_ARG(t);
+    int clientFD = THREAD_VAL(t);
+    rq->clientFD = clientFD;
+    rq->t_read = NULL;
+
+    struct thread *thr = NULL;
+
+    /* Receive srx server packets */
+    // TODO: function name changed
+    bRetVal =  processPackets(rq->proxy);
+
+    // connection error
+    if (!bRetVal)
+    {
+	if(g_current_read_thread)
+	{
+  	  thread_cancel(g_current_read_thread);
+	  zlog_debug ("[%s] read thread cancel ", __FUNCTION__);
+	}
+	rq->t_read = thread_add_timer (bm->master, checkClientConnection, rq,
+                                 RETRY_TIMER_SEC); // every 10 sec, try again
+
+	//
+	// TODO: after a certain amount time or try, clean up client connection
+	//
+    }
+    else
+    {
+      rq->t_read = thr = thread_add_read (bm->master, respawnReceivePacket, rq,
+                                          clientFD);
+      g_current_read_thread = thr;
+    }
+    return 0;
+}
+
+int initUnSocket(struct thread *t)
+{
+    struct sockaddr_un saddru_rv, saddru_rv_recv;
+    int     ufd, ufdRecv;
+    //socklen_t   len_saddr;
+    struct SRxThread *srx_rq = srx_thread_arg_new();
+    g_rq = srx_rq;
+    srx_rq->sock = -1;
+
+    /* init variables */
+    memset(&saddru_rv, 0x00, sizeof(struct sockaddr_un));
+    //len_saddr = sizeof(struct sockaddr_un);
+
+    /* setting socket address structure */
+    saddru_rv.sun_family = AF_UNIX;         /* AF_UNIX, PF_UNIX are same */
+    strncpy(&saddru_rv.sun_path[1], "srx", sizeof(saddru_rv.sun_path)-2);
+		/* Abstract name is "srx" followed by null bytes */
+		/* saddr.sun_path[0] has already set to 0 by memset() */
+
+    srx_rq->sock = ufd = socket(AF_UNIX, SOCK_DGRAM, IPPROTO_IP);
+    if (ufd == -1)
+    {
+      zlog_debug ("Fail: un_socket()");
+    }
+
+    if (bind(ufd, (struct sockaddr *)&saddru_rv, sizeof(saddru_rv)) == -1)
+    {
+      zlog_debug ("Fail: un_socket bind()");
+      exit(EXIT_FAILURE);
+    }
+
+
+    /* init Recv socket variables */
+    memset(&saddru_rv_recv, 0x00, sizeof(struct sockaddr_un));
+    saddru_rv_recv.sun_family = AF_UNIX;         /* AF_UNIX, PF_UNIX are same */
+    strncpy(&saddru_rv_recv.sun_path[1], "srxRecv",
+            sizeof(saddru_rv_recv.sun_path)-2);
+    ufdRecv = socket(AF_UNIX, SOCK_DGRAM, IPPROTO_IP);
+    if (ufdRecv == -1)
+    {
+      zlog_debug ("Fail: un_socket()");
+    }
+
+    if (bind(ufdRecv, (struct sockaddr *)&saddru_rv_recv,
+             sizeof(saddru_rv_recv)) == -1)
+    {
+      zlog_debug ("Fail: un_socket bind()");
+      exit(EXIT_FAILURE);
+    }
+
+    //zlog_debug (" ------ initUnSocket Event called by thread ");
+    //zlog_debug (" srx_rq: %p  and ufd: %d %s", srx_rq, srx_rq->sock, __func__);
+
+    //thread_add_read (bm->master, rq_recv, srx_rq, ufd);
+    //thread_add_read (bm->master, threadSRxRecv, srx_rq, ufdRecv);
+    //thread_execute(bm->master, initSRxRecvThread, NULL /* something arg */, 0);
+
+    if (flagDoConnectSrx != NULL)
+    {
+      zlog_debug("Request to connect to SRx server");
+      bool isConnected = srx_connect_proxy((struct bgp*)flagDoConnectSrx) == 0;
+      if (isConnected)
+      {
+        flagDoConnectSrx = NULL;
+      }
+      zlog_debug("Connection to SRx-server %s",
+                 (isConnected) ? "succeeded" : "failed");
+    }
+    return 0;
+}
+
+int checkSendQueue(struct thread *t)
+{
+    struct SRxThread *rq;
+    rq = (struct SRxThread *)THREAD_ARG(t);
+    if(rq) return 1;
+    return 0;
+
+}
+
+void threadControlCall(int type)
+{
+
+// TODO: KH use the SRxProxyError types
+    struct SRxThread *rq;
+
+    rq = g_rq;
+
+    if(type == COM_ERR_PROXY_UNKNOWN && rq->clientFD != 0)
+    {
+      // Never will happen because this error is never send!!!
+      FD_CLR (rq->clientFD, &bm->master->readfd);
+      zlog_debug (" FD_CLR called for avoiding select() error" );
+    }
+    else if(type == COM_ERR_PROXY_COULD_NOT_SEND)
+    {
+      if( FD_ISSET(rq->clientFD, &bm->master->readfd) )
+      {
+        FD_CLR (rq->clientFD, &bm->master->readfd);
+        zlog_debug (" FD_CLR called for avoiding select() error" );
+      }
+      return;
+    }
+    else if (type == COM_ERR_PROXY_UNKNOWN_UPDATE)
+    {
+      return;
+    }
+
+    // something went bad just give up....
+
+    if(g_current_read_thread)
+    {
+      zlog_debug ("%s thread cancel", __FUNCTION__);
+      thread_cancel(g_current_read_thread);
+      if(rq->clientFD > 0)
+      {
+        close(rq->clientFD);
+        rq->clientFD = -1;
+      }
+    }
+
+    if(   (type == COM_ERR_PROXY_CONNECTION_LOST)
+       || (type == COM_PROXY_DISCONNECT))
+    {
+      zlog_debug (" Disconnect or lost connection , respawn thread add timer" );
+      thread_add_timer (bm->master, checkClientConnection, rq, RETRY_TIMER_SEC);
+      // every 10 sec, respawn
+    }
+}
+#endif /* USE_SRX */
 
 static struct bgp_node *
 bgp_afi_node_get (struct bgp_table *table, afi_t afi, safi_t safi, struct prefix *p,
@@ -130,7 +428,20 @@ bgp_info_extra_get (struct bgp_info *ri)
 static struct bgp_info *
 bgp_info_new (void)
 {
+#ifdef USE_SRX
+  struct bgp_info *new = XCALLOC (MTYPE_BGP_ROUTE, sizeof (struct bgp_info));
+  if (new)
+  {
+    new->node = NULL;
+    new->info_hash = NULL;
+
+    new->updateID        = 0; // not specified yet
+    new->localID         = 0; // not specified yet
+  }
+  return new;
+#else /* USE_SRX */
   return XCALLOC (MTYPE_BGP_ROUTE, sizeof (struct bgp_info));
+#endif /* USE_SRX */
 }
 
 /* Free bgp route information. */
@@ -144,6 +455,24 @@ bgp_info_free (struct bgp_info *binfo)
   bgp_info_mpath_free (&binfo->mpath);
 
   peer_unlock (binfo->peer); /* bgp_info peer reference */
+#ifdef USE_SRX /* USE_SRX */
+  if (binfo->info_hash)
+  {
+    // Determine if update id or local id is used
+    if (binfo->updateID != 0)
+    {
+      bgp_info_unregister (binfo->info_hash, binfo->updateID);
+    //zlog_debug("withdraw update [0x%08X] to SRx server!", binfo->updateID);
+      deleteUpdate(binfo->peer->bgp->srxProxy, binfo->peer->bgp->srx_keepWindow,
+                   binfo->updateID);
+    }
+    else
+    {
+      bgp_info_unregister (binfo->info_hash, binfo->localID);
+    }
+    binfo->info_hash = NULL;
+  }
+#endif /* USE_SRX */
 
   XFREE (MTYPE_BGP_ROUTE, binfo);
 }
@@ -195,6 +524,9 @@ bgp_info_add (struct bgp_node *rn, struct bgp_info *ri)
     top->prev = ri;
   rn->info = ri;
   
+#ifdef USE_SRX
+  ri->node = rn;
+#endif /* USE_SRX */
   bgp_info_lock (ri);
   bgp_lock_node (rn);
   peer_lock (ri->peer); /* bgp_info peer reference */
@@ -304,6 +636,310 @@ bgp_info_unset_flag (struct bgp_node *rn, struct bgp_info *ri, u_int32_t flag)
   
   bgp_pcount_adjust (rn, ri);
 }
+#ifdef USE_SRX
+/** This method sets or frees the ignore flag depending on the system
+ * configuration and the update validation state.
+ *
+ * @param info the bgp update information
+ *
+ * @return 0 if the ignore flag is not set.
+ *         1 if the ignore flag is set.
+ */
+int bgp_info_set_ignore_flag (struct bgp_info* info)
+{
+  int ignore;
+  struct bgp *bgp;
+  int valRes;
+
+  ignore = 0;
+  bgp = info->peer->bgp;
+  valRes = srx_calc_validation_state(bgp, info);
+
+  // check the setting ignore-invalid according to the result value
+  if (bgp->srx_config & SRX_CONFIG_EVALUATE)
+  {
+    switch (valRes)
+    {
+      case SRx_RESULT_INVALID:
+        if (bgp->srx_val_policy & SRX_VAL_POLICY_IGNORE_INVALID)
+        {
+          ignore = 1;
+        }
+        break;
+      case SRx_RESULT_NOTFOUND:
+        if (bgp->srx_val_policy & SRX_VAL_POLICY_IGNORE_NOTFOUND)
+        {
+          ignore = 1;
+        }
+        break;
+      case SRx_RESULT_UNDEFINED:
+        if (bgp->srx_val_policy & SRX_VAL_POLICY_IGNORE_UNDEFINED)
+        {
+          ignore = 1;
+        }
+      default:
+        break;
+    }
+  }
+  else
+  {
+    if (ignore)
+    {
+      zlog_debug ("Evaluation disabled do not set ignore flag for update "
+                  "[0x%08X]!", info->updateID);
+      ignore = 0;
+    }
+  }
+
+  /* Adjust 'ignore' flag */
+  // Is this flag an original Quagga flag? if so is it possible that we
+  // overwrite a set flag by un-setting it? Should we use
+  if (CHECK_FLAG (info->flags, BGP_INFO_IGNORE))
+  {
+    if (ignore == 0)
+    {
+     // zlog_debug ("Remove 'Ignore' flag for update [0x%08X]!",
+     //             info->updateID);
+      bgp_info_unset_flag (info->node, info, BGP_INFO_IGNORE);
+    }
+  }
+  else if (ignore == 1)
+  {
+    //zlog_debug ("Setting 'Ignore' flag for update [0x%08X]!",
+    //            info->updateID);
+    bgp_info_set_flag (info->node, info, BGP_INFO_IGNORE);
+  }
+
+  return ignore;
+}
+
+/**
+ * This method determines the outcome of the validation result. Depending on the
+ * evaluation mode (no srx evaluation, srx evaluation bgpsec, or
+ * srx evaluation origin_only the result of this method might change.
+ *
+ * Possible results:
+ *   no srx evaluation:          SRx_RESULT_DONOTUSE
+ *
+ *   srx evaluation bgpsec:      SRx_RESULT_VALID, SRx_RESULT_INVALID,
+ *                               SRx_RESULT_UNDEFINED
+ *                               (valid requires path and origin validation to
+ *                               be valid, otherwise invalid!)
+ *
+ *   srx evaluation origin_only: SRx_RESULT_VALID, SRx_RESULT_NOTFOUND,
+ *                               SRx_RESULT_INVALID, SRx_RESULT_UNDEFINED
+ *
+ * Result table for bgpsec:
+ *
+ *   PATH | v | i | ? |
+ * ORIGIN |   |   |   |
+ * -------+---+---+---|
+ *  v     | v | i | ? |
+ * -------+---+---+---|
+ *  n     | i | i | i |
+ * -------+---+---+---|
+ *  i     | i | i | i |
+ * -------+---+---+---+
+ *  ?     | ? | i | ? |
+ * -------+---+---+---+
+ *
+ * @param bgp
+ * @param info
+ *
+ * @return SRx_RESULT_VALID, SRx_RESULT_INVALID, or SRx_RESULT_UNDEFINED
+ */
+int srx_calc_validation_state(struct bgp *bgp, struct bgp_info *info)
+{
+  int result;
+
+  result = SRx_RESULT_DONOTUSE;
+
+  if (srx_config_check(bgp, SRX_CONFIG_EVAL_PATH))
+  { // BGPSEC validation is selected!
+    switch (info->val_res_ROA)
+    {
+      case SRx_RESULT_VALID:
+        result = info->val_res_BGPSEC;
+        break;
+      case SRx_RESULT_NOTFOUND:
+      case SRx_RESULT_INVALID:
+        result = SRx_RESULT_INVALID;
+        break;
+      case SRx_RESULT_UNDEFINED:
+        result = info->val_res_BGPSEC == SRx_RESULT_INVALID
+                 ? SRx_RESULT_INVALID
+                 : SRx_RESULT_UNDEFINED;
+        break;
+      default:
+        zlog_err("BGPSEC validation calculation reports invalid ROA state. "
+                 "Sepcify result as UNDEFINED!");
+        result = info->val_res_BGPSEC == SRx_RESULT_UNDEFINED;
+
+    }
+  }
+  else if (srx_config_check(bgp, SRX_CONFIG_EVAL_ORIGIN))
+  { // Prefix origin validation only!
+    result = info->val_res_ROA;
+  }
+
+  return result;
+}
+
+/**
+ * Add the given update back into the process queue.
+ *
+ * @param info the BGP update.
+ */
+void srx_bgp_requeue_update(struct bgp_info *info)
+{
+  struct bgp_table *table;
+  table = (struct bgp_table *)info->node->table->info;
+
+  bgp_process (info->peer->bgp, info->node, table->afi, table->safi);
+}
+
+/**
+ * Requeue all updates associated with this router. this method is used for the
+ * terminal command "srx apply-policy"
+ *
+ * @param The bgp router
+ */
+void srx_bgp_requeue_all(struct bgp *bgp)
+{
+  struct bgp_table* table;
+  struct bgp_node *bnode;
+
+  if (bgp != NULL)
+  {
+    table = bgp->rib[AFI_IP][SAFI_MULTICAST];
+    for (bnode = bgp_table_top(table); bnode; bnode = bgp_route_next(bnode))
+    {
+      if (bnode->info != NULL)
+      {
+        srx_bgp_requeue_update(bnode->info);
+      }
+    }
+
+    table = bgp->rib[AFI_IP][SAFI_UNICAST];
+    for (bnode = bgp_table_top(table); bnode; bnode = bgp_route_next(bnode))
+    {
+      if (bnode->info != NULL)
+      {
+        srx_bgp_requeue_update(bnode->info);
+      }
+    }
+  }
+}
+
+
+/**
+ * @brief Check for bpg attribute whether it contains extra community values from peer
+ *
+ * @param attr
+ *
+ * @return Success or Failure
+ */
+int checkEcomSRxValid(struct attr* attr)
+{
+  int ret;
+
+  if (!attr->extra)
+    return -1;
+
+  struct attr_extra *attre = attr->extra;
+
+  if (!attre->ecommunity)
+    return -1;
+
+  struct ecommunity *ecom = attre->ecommunity;
+
+  if(!ecom->str || !ecom->val)
+    return -1;
+
+  if (BGP_DEBUG (update, UPDATE_IN))
+  {
+    zlog_debug("extended community: %s ", ecom->str );
+    zlog_debug("val: (type)0x%x, (ValidStatus)0x%x ", ecom->val[0], ecom->val[7]);
+  }
+
+  switch (ecom->val[7])
+  {
+    case ECOMMUNITY_BGPSEC_VALID:       // 0
+      if (BGP_DEBUG (update, UPDATE_IN))
+        zlog_debug(" QuaggaSRx Received \"SRx Ecommunity value VALID\" from peer ");
+      ret = ECOMMUNITY_BGPSEC_VALID;
+      break;
+    case ECOMMUNITY_BGPSEC_NOT_FOUND:   // 1
+      ret = ECOMMUNITY_BGPSEC_NOT_FOUND;
+      break;
+    case ECOMMUNITY_BGPSEC_INVALID:     // 2
+      ret = ECOMMUNITY_BGPSEC_INVALID;
+      break;
+    case 0xAB:      // test value
+      ret = ECOMMUNITY_BGPSEC_UNDEFINED;// 3 undefined
+      break;
+    default:        // unknown value
+      ret = -1;
+      break;
+  }
+
+  return ret;
+}
+
+/**
+ * Modifies the BGP update information according to the SRX settings.
+ * This will be done using the bgp_info data structure.
+ * This method is called by the SRx callback to update the validation result.
+ *
+ * In case if one result ROA / BGPSEC is UNDEFINED the update will by default be
+ * ignored.
+ * 
+ * Also the update will only be put back into the queue if the ignore state
+ * changed or the validation result changed.
+ */
+void bgp_info_set_validation_result (struct bgp_info *info,
+                                     ValidationResultType resType,
+                                     uint8_t roaResult, uint8_t bgpsecResult)
+{
+  /* An internal error occurred */
+  if ((resType & SRX_FLAG_ROA_AND_BGPSEC) == 0)
+  {
+    zlog_debug ("No SRx result provided! - Update [0x%08X]", info->updateID);
+  }
+  else
+  {
+    struct bgp *bgp   = info->peer->bgp;
+    int requeue       = 0;
+    
+    // First store the current status
+    uint8_t oldResult = srx_calc_validation_state(bgp, info);
+    uint8_t oldIgnore = CHECK_FLAG (info->flags, BGP_INFO_IGNORE) ? 1 : 0;
+
+    // Now store the new results.
+    if ((resType & SRX_FLAG_ROA) == SRX_FLAG_ROA)
+    {
+      info->val_res_ROA = roaResult;
+    }
+    if ((resType & SRX_FLAG_BGPSEC) == SRX_FLAG_BGPSEC)
+    {
+      info->val_res_BGPSEC = bgpsecResult;
+    }
+
+    // Check if it is fully valid and if not decide if the update has to be
+    // ignored
+    bool ignoreChanged = bgp_info_set_ignore_flag(info) != oldIgnore;
+    bool resultChanged = oldResult != srx_calc_validation_state(bgp, info);
+    
+    // Only re-queue if the ignore state changed or if the result changed.
+    requeue = ignoreChanged || resultChanged;
+
+    if (requeue)
+    {
+      srx_bgp_requeue_update(info);
+    }
+  }
+}
+#endif /* USE_SRX */
 
 /* Get MED value.  If MED value is missing and "bgp bestpath
    missing-as-worst" is specified, treat it as the worst value. */
@@ -321,9 +957,61 @@ bgp_med_value (struct attr *attr, struct bgp *bgp)
     }
 }
 
-/* Compare two bgp route entity.  Return -1 if new is preferred, 1 if exist
- * is preferred, or 0 if they are the same (usually will only occur if
- * multipath is enabled */
+#ifdef USE_SRX
+
+/**
+ * This method caclulated the new local pref.
+ *
+ * @param prefPol The local preference policy for the given result value.
+ * @param locPref The current local pref that needs to be modified.
+ *
+ * @return The modified local preference (0 in case of an underflow).
+ */
+static u_int32_t srx_loc_prev_value(struct bgp* bgp, u_int32_t locPref,
+                                    int valResult)
+{
+  struct srx_local_pref* prefPolicy;
+  bool isSet;
+
+  switch (valResult)
+  {
+    case SRx_RESULT_VALID:
+      prefPolicy = &bgp->srx_val_local_pref[VAL_LOCPRF_VALID];
+      isSet = prefPolicy->is_set > 0;
+      break;
+    case SRx_RESULT_NOTFOUND:
+      prefPolicy = &bgp->srx_val_local_pref[SRx_RESULT_NOTFOUND];
+      isSet = prefPolicy->is_set > 0;
+      break;
+    case SRx_RESULT_INVALID:
+      prefPolicy = &bgp->srx_val_local_pref[VAL_LOCPRF_INVALID];
+      isSet = prefPolicy->is_set > 0;
+      break;
+    default:
+      prefPolicy = NULL;
+      isSet = false;
+  }
+
+  if (isSet)
+  {
+    if (prefPolicy->relative == 0)
+    {
+      locPref = prefPolicy->value;
+    }
+    else if (prefPolicy->relative == -1)
+    {
+      locPref = (locPref > prefPolicy->value) ? (locPref - prefPolicy->value)
+                                              : 0; // underflow
+    }
+    else
+    {
+      locPref += prefPolicy->value;
+    }
+  }
+
+  return locPref;
+}
+#endif /* USE_SRX */
 static int
 bgp_info_cmp (struct bgp *bgp, struct bgp_info *new, struct bgp_info *exist,
               afi_t afi, safi_t safi)
@@ -346,12 +1034,37 @@ bgp_info_cmp (struct bgp *bgp, struct bgp_info *new, struct bgp_info *exist,
   int internal_as_route;
   int confed_as_route;
   int ret;
+#ifdef USE_SRX
+  int use_evaluation =    srx_config_check(bgp, SRX_CONFIG_EVAL_ORIGIN)
+                       || srx_config_check(bgp, SRX_CONFIG_EVAL_PATH);
+  int new_result = 0;
+  int exist_result = 0;
+#endif /* USE_SRX */
 
   /* 0. Null check. */
   if (new == NULL)
     return 1;
   if (exist == NULL)
     return -1;
+
+#ifdef USE_SRX
+  if (use_evaluation)
+  {
+    /* 0.25 stop if ignore flag is set*/
+    // In case an update was received and declared to be ignored it is put back
+    // into the queue but still will be processed here. This is the reason why
+    // we have to double check here to assure the ignore state.
+    if (CHECK_FLAG (new->flags, BGP_INFO_IGNORE))
+    {
+      zlog_debug("Ignore update [0x%08X] in decision process!", new->updateID);
+      return 0;
+    }
+
+    // Retrieve Result
+    exist_result = srx_calc_validation_state(bgp, exist);
+    new_result   = srx_calc_validation_state(bgp, new);
+  }
+#endif /* USE_SRX */
 
   newattr = new->attr;
   existattr = exist->attr;
@@ -379,10 +1092,36 @@ bgp_info_cmp (struct bgp *bgp, struct bgp_info *new, struct bgp_info *exist,
   if (existattr->flag & ATTR_FLAG_BIT (BGP_ATTR_LOCAL_PREF))
     exist_pref = existattr->local_pref;
 
+#ifdef USE_SRX
+  if (use_evaluation)
+  {
+    /* Apply srx policy for local pref manipulation if applicable */
+    new_pref   = srx_loc_prev_value(bgp, new_pref, new_result);
+    exist_pref = srx_loc_prev_value(bgp, exist_pref, exist_result);
+  }
+#endif /* USE_SRX */
+
   if (new_pref > exist_pref)
     return -1;
   if (new_pref < exist_pref)
-    return 1;
+  
+#ifdef USE_SRX
+  if (use_evaluation && CHECK_FLAG (bgp->srx_val_policy,
+                                    SRX_VAL_POLICY_PREFER_VALID))
+  {
+    /* 2.5. Prefer valid > everything else*/
+
+    // Prefer VALID over Everything else!
+    if ((new_result == SRx_RESULT_VALID) && (exist_result != SRx_RESULT_VALID))
+    {
+      return -1;
+    }
+    if ((new_result != SRx_RESULT_VALID) && (exist_result == SRx_RESULT_VALID))
+    {
+      return 1;
+    }
+  }
+#endif /* USE_SRX */
 
   /* 3. Local route check. We prefer:
    *  - BGP_ROUTE_STATIC
@@ -1449,7 +2188,7 @@ bgp_best_selection (struct bgp *bgp, struct bgp_node *rn,
             bgp_mp_list_add (&mp_list, ri);
         }
     }
-
+    
   if (!bgp_flag_check (bgp, BGP_FLAG_DETERMINISTIC_MED))
     bgp_info_mpath_update (rn, new_select, old_select, &mp_list, afi, safi);
 
@@ -2104,6 +2843,244 @@ bgp_withdraw_rsclient (struct peer *rsclient, afi_t afi, safi_t safi,
   bgp_unlock_node (rn);
 }
 
+#ifdef USE_SRX
+static void prefix_to_IPPrefix (struct prefix* src, IPPrefix* dst)
+{
+  dst->length = src->prefixlen;
+
+#ifdef HAVE_UPV6
+  dst->ip.version = GET_VERSION_OF_AF (src->family);
+  memcpy (&dst->ip.addr, &src->u, 16);
+#else
+  dst->ip.version = 4;
+  dst->ip.addr.v4.u32 = src->u.prefix4.s_addr;
+#endif
+}
+
+/**
+ * This method is responsible for filling the bgpsec data array. Currently the
+ * data blob only contains the AS path.
+ *
+ * @param info The bgp update
+ * @param bgpsec The data object to be filled.
+ */
+static BGPSecData* srx_create_bgpsec_data (struct bgp_info* info)
+{
+  struct attr* attr = info->attr;
+  struct assegment* pathSeg;
+  BGPSecData* bgpsec = malloc(sizeof(BGPSecData));
+  memset(bgpsec, 0, sizeof(BGPSecData));
+
+  // Fill the BGP4 path information
+  if (attr->aspath != NULL)
+  {
+    int dataIdx = 0;
+    int segIdx  = 0;
+    // take the last element in each segment. At the end the origin is
+    // written in the oas value.
+    pathSeg = attr->aspath->segments;
+    int prevSize = 0;
+    
+    while (pathSeg != NULL)
+    {
+      if (pathSeg->type == AS_SEQUENCE)
+      {
+        int size = pathSeg->length * 4;
+        bgpsec->numberHops = pathSeg->length;
+        // Prepare memory
+        if (bgpsec->asPath == NULL)
+        {
+          bgpsec->asPath = malloc(size);
+        }
+        else
+        {
+          bgpsec->asPath = realloc(bgpsec->asPath, size+prevSize);
+        }
+        
+        // Fill array
+        for (segIdx = 0;segIdx < pathSeg->length; segIdx++)
+        {
+          bgpsec->asPath[dataIdx++] = htonl(pathSeg->as[segIdx]);
+        }
+        prevSize += size;
+      }
+      pathSeg = pathSeg->next;
+    }
+  }
+  
+  // Now Fill the BGPSEC Path Attribtue if it exists
+  if (attr->bgpsec_validationData != NULL)
+  {
+    SCA_BGPSEC_PathAttribute* pa = (SCA_BGPSEC_PathAttribute*)attr->bgpsec_validationData->bgpsec_path_attr;
+    int size = ntohs(pa->attrLength);
+    if (bgpsec->bgpsec_path_attr == NULL)
+    {
+      bgpsec->bgpsec_path_attr = malloc(size);
+    }
+    else
+    {
+      bgpsec->bgpsec_path_attr = realloc(bgpsec->bgpsec_path_attr, size);
+    }
+    bgpsec->attr_length = size;
+    memcpy(bgpsec->bgpsec_path_attr, attr->bgpsec_validationData->bgpsec_path_attr, 
+          size);
+  }
+
+  return bgpsec;
+}
+
+/**
+ * Frees the memory allocated by the bgpsec object.
+ *
+ * @param bgpsec the object to be freed. Including the internal data structure.
+ */
+static void srx_free_bgpsec_data (BGPSecData* bgpsec)
+{
+  // First reset the inner data
+  if (bgpsec->asPath != NULL)
+  {
+    memset(bgpsec->asPath, 0, (bgpsec->numberHops * 4));
+    free(bgpsec->asPath);
+  }
+  if (bgpsec->bgpsec_path_attr != NULL)
+  {
+    memset(bgpsec->bgpsec_path_attr, 0, bgpsec->attr_length);
+    free (bgpsec->bgpsec_path_attr);
+  }
+  memset (bgpsec, 0, sizeof(BGPSecData));
+  free(bgpsec);
+}
+
+// Use 2^28 to allow a printout formating of "+%07X" for local Id's
+// instead of %08X during 'show ip bgp'
+#define MAX_VALUE_INT 0x0FFFFFFF /* 2^28 -1 */
+static unsigned long suiLocalID = 0;
+
+/**
+ * Generate the next local ID
+ *
+ * @return the next available local id
+ */
+uint32_t getNextLocalID(void)
+{
+  if (suiLocalID < MAX_VALUE_INT ) /* MAX_REQUEST_TOKEN */
+  {
+    suiLocalID++;
+  }
+  else
+  {
+    suiLocalID = 1; /*MIN_REQUEST_TOKEN */
+  }
+
+  return suiLocalID;
+}
+
+/**
+ * This method is called to start an update verification. If the update info
+ * contains an updateID different than zero "0" the local ID MUST be greater
+ * than zero and vice versa.
+ *
+ * By default the result values are set to the default value except the default
+ *
+ * @param bgp a pointer to the bgp configuration
+ * @param info pointer to the update information
+ * @param defResult The default result provided.
+ * @param doRegisterLocalID If set then register the local ID with the info hash
+ */
+void verify_update (struct bgp *bgp, struct bgp_info *info,
+                    SRxDefaultResult* defResult, bool doRegisterLocalID)
+{
+  /* the received extend community value handling */
+  if (CHECK_FLAG (bgp->srx_ecommunity_flags, SRX_BGP_FLAG_ECOMMUNITY))
+  {
+  int retValid = -1;
+  retValid = checkEcomSRxValid(info->attr);
+
+  if(retValid >= 0 && retValid <= 3)
+  {
+    if(retValid == ECOMMUNITY_BGPSEC_VALID)
+    {
+        defResult->result.roaResult = SRx_RESULT_VALID;
+        if (BGP_DEBUG (update, UPDATE_IN))
+          zlog_debug(" Ecommunity Value [VALID] ");
+    }
+    else if(retValid == ECOMMUNITY_BGPSEC_NOT_FOUND)
+    {
+        defResult->result.roaResult = SRx_RESULT_NOTFOUND;
+        if (BGP_DEBUG (update, UPDATE_IN))
+          zlog_debug(" Ecommunity Value [NOT FOUND] ");
+    }
+    else if(retValid == ECOMMUNITY_BGPSEC_INVALID)
+    {
+        defResult->result.roaResult = SRx_RESULT_INVALID;
+        if (BGP_DEBUG (update, UPDATE_IN))
+          zlog_debug(" Ecommunity Value [INVALID] ");
+    }
+    else if(retValid == ECOMMUNITY_BGPSEC_UNDEFINED) // UNDEFINED
+    {
+        defResult->result.roaResult = SRx_RESULT_UNDEFINED;
+        if (BGP_DEBUG (update, UPDATE_IN))
+          zlog_debug(" Ecommunity VALUE AB [Undefined]");
+      }
+    }
+  }
+
+  // first use the default result value as regular result value
+  if (defResult->result.roaResult != SRx_RESULT_DONOTUSE)
+  {
+    info->val_res_ROA = defResult->result.roaResult;
+  }
+  if (defResult->result.bgpsecResult != SRx_RESULT_DONOTUSE)
+  {
+    info->val_res_BGPSEC = defResult->result.bgpsecResult;
+  }
+
+
+  // If this update has a local ID it might need to be registered. This will be
+  // the first
+  if (info->localID > 0 && doRegisterLocalID)
+  {
+    bgp_info_register (bgp->info_lid_hash, info, info->localID);
+  }
+
+  // Now let proxy change it if necessary
+  // Also check if connectionHanlder->established (connHandler[1])
+  // bool type must not be zero
+  if (isConnected (bgp->srxProxy))
+  {
+    as_t oas;
+
+    // first determine that the update is not local
+    if (info->localID != 0 || info->updateID != 0)
+    {
+      // let SRx proxy initiate validation and get the update id */
+      oas = aspath_origin_as (info->attr->aspath);
+
+      // Prepare the prefix
+      IPPrefix* prefix = malloc(sizeof(IPPrefix));
+      prefix_to_IPPrefix (&info->node->p, prefix);
+
+      // Generate BGPSEC data currently no data at all, here is a good place
+      // to add at least the AS path
+      BGPSecData* bgpsec = srx_create_bgpsec_data(info);
+
+      verifyUpdate(bgp->srxProxy, info->localID, true, true, defResult,
+                   prefix, oas, bgpsec);
+
+      srx_free_bgpsec_data(bgpsec);
+      free(prefix);
+    }
+  }
+  // @TODO: Here is the point where we could call validate if we do not have any 
+  //        connection to the SRx server and we plan to do local validation.
+  //        If not, no path validation will be performed - period.
+  // else { DO PATH VALIDATION }
+
+  // Check if update has to be ignored!
+  bgp_info_set_ignore_flag(info);
+}
+#endif /* USE_SRX */
+
 static int
 bgp_update_main (struct peer *peer, struct prefix *p, struct attr *attr,
 	    afi_t afi, safi_t safi, int type, int sub_type,
@@ -2319,6 +3296,31 @@ bgp_update_main (struct peer *peer, struct prefix *p, struct attr *attr,
       /* Update to new attribute.  */
       bgp_attr_unintern (&ri->attr);
       ri->attr = attr_new;
+#ifdef USE_SRX
+// See BZ324: The attributes of the update will be replaced. This means the
+// update itself will get a different update id. Here reset the validation
+// data to the default data.
+      if (ri->info_hash != NULL)
+      {
+        bgp_info_unregister(ri->info_hash, ri->localID != 0 ? ri->localID == 0
+                                                            : ri->updateID);
+        ri->info_hash = NULL;
+        // remove update from SRx-server in case it has already an update ID
+        if (ri->updateID > 0)
+        {
+          deleteUpdate(bgp->srxProxy, bgp->srx_keepWindow, ri->updateID);
+          ri->updateID = 0;
+        }
+        else
+        {
+          ri->localID  = 0;
+        }
+
+        ri->val_res_ROA    = bgp->srx_default_roaVal;
+        ri->val_res_BGPSEC = bgp->srx_default_bgpsecVal;
+      }
+#endif /* USE_SRX */
+
 
       /* Update MPLS tag.  */
       if (safi == SAFI_MPLS_VPN)
@@ -2360,6 +3362,26 @@ bgp_update_main (struct peer *peer, struct prefix *p, struct attr *attr,
       /* Process change. */
       bgp_aggregate_increment (bgp, p, ri, afi, safi);
 
+#ifdef USE_SRX
+      /* Verify but this time to an already existing update where the attributes
+       * were changed. BZ324 */
+      ri->localID = getNextLocalID();
+
+      // Here use the value of community String
+      SRxDefaultResult* defRes = malloc(sizeof(SRxDefaultResult));
+      // Here fill with community string value if possible, the use as source
+      // SRxRS_IGP or a source provided by community string.
+
+      // TODO: Use Community String value if available
+      defRes->resSourceROA        = SRxRS_ROUTER;
+      defRes->resSourceBGPSEC     = SRxRS_ROUTER;
+      defRes->result.roaResult    = bgp->srx_default_roaVal;
+      defRes->result.bgpsecResult = bgp->srx_default_bgpsecVal;
+
+      verify_update (bgp, ri, defRes, true);
+      free(defRes);
+#endif /* USE_SRX */
+
       bgp_process (bgp, rn, afi, safi);
       bgp_unlock_node (rn);
 
@@ -2383,6 +3405,21 @@ bgp_update_main (struct peer *peer, struct prefix *p, struct attr *attr,
   new->attr = attr_new;
   new->uptime = bgp_clock ();
 
+#ifdef USE_SRX
+  if (BGP_DEBUG (bgpsec, BGPSEC_DETAIL))
+  {
+    zlog_debug("[BGPSEC] ----[%s]: ATTRIBUTE: attr:%p aspath:%p (attr interned) bpgsec:%p",\
+        __FUNCTION__, attr_new, attr_new->aspath, attr_new->bgpsecPathAttr);
+    if(attr_new->aspath && attr_new->aspath->segments)
+    zlog_debug("[BGPSEC] [as_segment:%p] as_segment_length:%d aspath_refcnt: %ld",
+        attr_new->aspath->segments, attr_new->aspath->segments->length,
+        attr_new->aspath->refcnt);
+  }
+
+  if (BGP_DEBUG (bgpsec, BGPSEC_IN) && BGP_DEBUG (bgpsec, BGPSEC_DETAIL))
+    if(attr_new->bgpsecPathAttr)
+      print_signature(attr_new->bgpsecPathAttr);
+#endif
   /* Update MPLS tag. */
   if (safi == SAFI_MPLS_VPN)
     memcpy ((bgp_info_extra_get (new))->tag, tag, 3);
@@ -2408,7 +3445,27 @@ bgp_update_main (struct peer *peer, struct prefix *p, struct attr *attr,
   
   /* Register new BGP information. */
   bgp_info_add (rn, new);
+#ifdef USE_SRX
+  /* Verify */
+  new->localID = getNextLocalID();
+  new->val_res_ROA     = bgp->srx_default_roaVal;
+  new->val_res_BGPSEC  = bgp->srx_default_bgpsecVal;
+
+  // Here use the value of community String
+  SRxDefaultResult* defRes = malloc(sizeof(SRxDefaultResult));
+  // Here fill with community string value if possible, the use as source
+  // SRxRS_IGP or a source provided by community string.
+
+  // TODO: Use Community String value if available
+  defRes->resSourceROA        = SRxRS_ROUTER;
+  defRes->resSourceBGPSEC     = SRxRS_ROUTER;
+  defRes->result.roaResult    = bgp->srx_default_roaVal;
+  defRes->result.bgpsecResult = bgp->srx_default_bgpsecVal;
   
+  verify_update (bgp, new, defRes, true);
+  free(defRes);
+#endif /* USE_SRX */
+
   /* route_node_get lock */
   bgp_unlock_node (rn);
 
@@ -3044,7 +4101,7 @@ bgp_clear_route (struct peer *peer, afi_t afi, safi_t safi,
       assert (0);
       break;
     }
-
+  
   /* unlock if no nodes got added to the clear-node-queue. */
   if (!peer->clear_node_queue->thread)
     peer_unlock (peer);
@@ -3300,7 +4357,7 @@ bgp_nlri_parse_ip (struct peer *peer, struct attr *attr,
 	  if (IN_CLASSD (ntohl (p.u.prefix4.s_addr)))
 	    {
 	     /* 
- 	      * From RFC4271 Section 6.3: 
+ 	      * From draft-ietf-idr-bgp4-22, Section 6.3:
 	      * 
 	      * If a prefix in the NLRI field is semantically incorrect
 	      * (e.g., an unexpected multicast IP address), an error SHOULD
@@ -3355,6 +4412,7 @@ bgp_nlri_parse_ip (struct peer *peer, struct attr *attr,
   /* Packet length consistency check. */
   if (pnt != lim)
     {
+
       plog_err (peer->log,
                 "%s [Error] Update packet error"
                 " (prefix length mismatch with total length)",
@@ -3698,6 +4756,9 @@ bgp_static_update (struct bgp *bgp, struct prefix *p,
       if (CHECK_FLAG (rsclient->af_flags[afi][safi], PEER_FLAG_RSERVER_CLIENT))
         bgp_static_update_rsclient (rsclient, p, bgp_static, afi, safi);
     }
+
+
+
 }
 
 void
@@ -5836,6 +6897,154 @@ enum bgp_display_type
   normal_list,
 };
 
+#ifdef USE_SRX
+
+
+/**
+ * Print the validation result v,i,u,?, or - depending on the state.
+ *
+ * @param vty the output terminal
+ * @param state the validation state to be printed
+ */
+static void srx_validation_vty_short_out(struct vty *vty, int state)
+{
+  switch (state)
+  {
+    case SRx_RESULT_VALID:
+      vty_out (vty, "v");
+      break;
+    case SRx_RESULT_NOTFOUND:
+      vty_out (vty, "n");
+      break;
+    case SRx_RESULT_INVALID:
+      vty_out (vty, "i");
+      break;
+    case SRx_RESULT_UNDEFINED:
+      vty_out (vty, "?");
+      break;
+    default:
+      vty_out (vty, "-");
+  }
+}
+
+/**
+ * Print the additional SRx validation information to the screen
+ *
+ * @param vty the terminal
+ * @param binfo the update information.
+ */
+static void srx_route_vty_validation_out(struct vty *vty,
+                                         struct bgp_info *binfo)
+{
+  struct bgp *bgp;
+  bgp = binfo->peer->bgp;
+  int valState = SRx_RESULT_UNDEFINED;
+  int locPrefPol = -1;
+
+  if ((bgp->srx_config & SRX_CONFIG_DISPLAY_INFO) != 0)
+  {
+    // The Ident (update id)
+    if (binfo->updateID == 0)
+    {
+      if (binfo->localID != 0)
+      {
+        vty_out (vty, "+%07X ", binfo->localID);
+      }
+      else
+      {
+        vty_out (vty, "-------- ");
+      }
+    }
+    else
+    {
+      vty_out (vty, "%08X ", binfo->updateID);
+    }
+    // Calculate the total validation state
+    valState = srx_calc_validation_state(bgp, binfo);
+    // Print the total validation result depending on the validation mode
+    srx_validation_vty_short_out(vty, valState);
+    vty_out (vty, "(");
+    if ((bgp->srx_config & SRX_CONFIG_EVAL_ORIGIN) != 0)
+    {
+      // print the origin validation
+      srx_validation_vty_short_out(vty, binfo->val_res_ROA);
+    }
+    else
+    {
+      vty_out (vty, "-");
+    }
+    vty_out (vty, ",");
+    if ((bgp->srx_config & SRX_CONFIG_EVAL_PATH) != 0)
+    {
+      // print path validation.
+      srx_validation_vty_short_out(vty, binfo->val_res_BGPSEC);
+    }
+    else
+    {
+      vty_out (vty, "-");
+    }
+    vty_out (vty, ") ");
+
+    // Determine local pref policy
+    switch (valState)
+    {
+      case SRx_RESULT_VALID:
+        locPrefPol = VAL_LOCPRF_VALID;
+        break;
+      case SRx_RESULT_NOTFOUND:
+        locPrefPol = VAL_LOCPRF_NOTFOUND;
+        break;
+      case SRx_RESULT_INVALID:
+        locPrefPol = VAL_LOCPRF_INVALID;
+        break;
+      default:
+        locPrefPol = -1;
+    }
+    if (locPrefPol > -1)
+    {
+      if (bgp->srx_val_local_pref[locPrefPol].is_set)
+      {
+        switch (bgp->srx_val_local_pref[locPrefPol].relative)
+        {
+          case -1:
+            vty_out (vty, "-");
+            break;
+          case  1:
+            vty_out (vty, "+");
+            break;
+          default:
+            vty_out (vty, " ");
+        }
+        vty_out (vty, "%4d,", bgp->srx_val_local_pref[locPrefPol].value);
+      }
+      else
+      {
+        vty_out (vty, "      ");
+      }
+    }
+    else
+    {
+      vty_out (vty, "      ");
+    }
+    vty_out (vty, "   ");
+    if (CHECK_FLAG (binfo->flags, BGP_INFO_IGNORE))
+    {
+      vty_out (vty, "I");
+    }
+    else if ((bgp->srx_config & SRX_CONFIG_EVALUATE) == 0)
+    {
+      vty_out (vty, "D");
+    }
+    else
+    {
+      vty_out (vty, " ");
+    }
+    vty_out (vty, "   ");
+  }
+}
+
+#endif /* USE_SRX */
+
 /* Print the short form route status for a bgp_info */
 static void
 route_vty_short_status_out (struct vty *vty, struct bgp_info *binfo)
@@ -5869,6 +7078,10 @@ route_vty_short_status_out (struct vty *vty, struct bgp_info *binfo)
       vty_out (vty, "i");
     else
       vty_out (vty, " "); 
+
+#ifdef USE_SRX
+  srx_route_vty_validation_out (vty, binfo);
+#endif /* USE_SRX */
 }
 
 /* called from terminal list command */
@@ -5936,7 +7149,7 @@ route_vty_out(
 	      int len;
 	      char buf[BUFSIZ];
 
-	      len = vty_out (vty, "%s",
+	  len = vty_out (vty, "%s",
 			     inet_ntop (AF_INET6, &attr->extra->mp_nexthop_global,
 			     buf, BUFSIZ));
 	      len = 16 - len;
@@ -5945,7 +7158,7 @@ route_vty_out(
 	      else
 		vty_out (vty, "%*s", len, " ");
 	    }
-         else
+      else
 	   {
 	     vty_out(vty, "?");
 	   }
@@ -5959,12 +7172,69 @@ route_vty_out(
       if (attr->flag & ATTR_FLAG_BIT (BGP_ATTR_MULTI_EXIT_DISC))
 	vty_out (vty, "%10u ", attr->med);
       else
-	  vty_out (vty, "          ");
+
+#ifdef USE_SRX
+      // Determine srx policy local pref
+      struct bgp* bgp = binfo->peer->bgp;
+      int srxResult = srx_calc_validation_state(bgp, binfo);
+      struct srx_local_pref* srxLocPref;
+      int srxDoLocPref;
+
+      if (bgp != NULL)
+      {
+        switch (srxResult)
+        {
+          case SRx_RESULT_VALID:
+            srxLocPref = &bgp->srx_val_local_pref[VAL_LOCPRF_VALID];
+            srxDoLocPref = 1; break;
+          case SRx_RESULT_NOTFOUND:
+            srxLocPref = &bgp->srx_val_local_pref[VAL_LOCPRF_NOTFOUND];
+            srxDoLocPref = 1; break;
+          case SRx_RESULT_INVALID:
+            srxLocPref = &bgp->srx_val_local_pref[VAL_LOCPRF_INVALID];
+            srxDoLocPref = 1; break;
+          default:
+            srxDoLocPref = 0;
+            srxLocPref = NULL;
+        }
+      }
+     else
+      {
+        srxDoLocPref = 0;
+        srxLocPref = NULL;
+      }
+#endif /* USE_SRX */
 
       if (attr->flag & ATTR_FLAG_BIT (BGP_ATTR_LOCAL_PREF))
-	vty_out (vty, "%7u ", attr->local_pref);
+#ifdef USE_SRX
+      {
+        if (srxDoLocPref)
+        {
+          vty_out (vty, "%7ua", srxLocPref->relative
+            ? attr->local_pref + srxLocPref->relative * srxLocPref->value
+            : srxLocPref->value);
+        }
+        else
+        {
+	      vty_out (vty, "%7u ", attr->local_pref);
+        }
+#else /* USE_SRX */
+	vty_out (vty, "%7u", attr->local_pref);
+#endif /* USE_SRX */
+
+#ifdef USE_SRX
+      }
+      else if (srxDoLocPref && srxLocPref->is_set)
+      {
+        vty_out (vty, "%7us", srxLocPref->value);
+      }
+#endif /* USE_SRX */
       else
+#ifdef USE_SRX
+	vty_out (vty, "        ");
+#else /* USE_SRX */
 	  vty_out (vty, "       ");
+#endif /* USE_SRX */
 
       vty_out (vty, "%7u ", (attr->extra ? attr->extra->weight : 0));
     
@@ -6201,6 +7471,158 @@ flap_route_vty_out (struct vty *vty, struct prefix *p,
   vty_out (vty, "%s", VTY_NEWLINE);
 }
 
+#ifdef USE_SRX
+
+/**
+ * Print the SRx validation details of the given route on the terminal.
+ *
+ * @param vty The terminal
+ * @param bgp The bgp router instance
+ * @param binfo The route information.
+ */
+static void srx_route_vty_out_detail(struct vty *vty, struct bgp *bgp,
+                                     struct bgp_info *binfo)
+{
+  static const char *INDEX_STR[4] =
+  {
+    "valid",
+    "notfound",
+    "invalid",
+    "undefined"       // might be removed again
+  };
+
+  vty_out (vty, "    SRx Information:%s", VTY_NEWLINE);
+  vty_out (vty, "      Update ID: 0x%08X%s", binfo->updateID, VTY_NEWLINE);
+  if (CHECK_FLAG(bgp->srx_config, SRX_CONFIG_EVAL_ORIGIN))
+  {
+    if (CHECK_FLAG (binfo->flags, BGP_INFO_IGNORE))
+    {
+      vty_out (vty, "      This update will be ignored!%s",VTY_NEWLINE);
+    }
+    if (aspath_count_hops (binfo->attr->aspath) == 0)
+    {
+      vty_out (vty, "      Internal update, no policy processing performed!!%s",
+               VTY_NEWLINE);
+    }
+    else
+    {
+      vty_out (vty, "      Validation:%s", VTY_NEWLINE);
+      vty_out (vty, "        prefix-origin: %s%s", INDEX_STR[binfo->val_res_ROA],
+                                             VTY_NEWLINE);
+      if (CHECK_FLAG(bgp->srx_config, SRX_CONFIG_EVAL_PATH))
+      {
+        vty_out (vty, "        path:   %s%s", INDEX_STR[binfo->val_res_BGPSEC],
+                                        VTY_NEWLINE);
+        vty_out (vty, "        bgpsec: %s  (combination of prefix-origin and "
+                      "path validation)%s",
+                      INDEX_STR[srx_calc_validation_state(bgp, binfo)],
+                      VTY_NEWLINE);
+      }
+      else
+      {
+        vty_out (vty, "        path:          processing disabled!%s",
+                      VTY_NEWLINE);
+      }
+    }
+
+    // Add BGPSEC information
+    vty_out (vty, "      PathType: ");
+    if (!binfo->attr->bgpsecPathAttr)
+    {
+      vty_out (vty, "AS-PATH%s", VTY_NEWLINE);
+    }
+    else
+    {
+      struct PathSegment* pathSegment;
+      struct SigBlock *sigBlock;
+      struct SigSegment *sigSegment1;
+      struct SigSegment *sigSegment2;
+
+      int blockCounter=0;
+      int segCounter=0;
+
+      pathSegment = binfo->attr->bgpsecPathAttr->pathSegments;
+      sigBlock    = binfo->attr->bgpsecPathAttr->sigBlocks;
+
+      // Determine the number of path segments by counting the number of
+      // path segments
+      while (pathSegment)
+      {
+        segCounter++;
+        pathSegment = pathSegment->next;
+      }
+
+       // Determine the number of signature blocks
+      sigBlock = binfo->attr->bgpsecPathAttr->sigBlocks;
+      blockCounter=0;
+      while (sigBlock)
+      {
+        blockCounter++;
+        sigBlock = sigBlock->next;
+      }
+
+      vty_out (vty, "BGPSEC-Path ( %d signature blocks, each with %d path "
+                     "segments)%s", blockCounter, segCounter, VTY_NEWLINE);
+
+      sigBlock    = binfo->attr->bgpsecPathAttr->sigBlocks;
+      pathSegment = binfo->attr->bgpsecPathAttr->pathSegments;
+      sigSegment1 = sigBlock->sigSegments;
+      sigSegment2 = (sigBlock->next) ? sigBlock->next->sigSegments : NULL;
+
+      // Now print information about each block and its segments:
+      while(sigBlock)
+      {
+        vty_out (vty, "        signature block #%d: algorithm suite id %d%s",
+                      blockCounter, sigBlock->algoSuiteId, VTY_NEWLINE);
+        sigBlock = sigBlock->next;
+      }
+
+      // Now walk through the path segments and display them incl. signatures
+      segCounter=0;
+      pathSegment = binfo->attr->bgpsecPathAttr->pathSegments;
+      while (pathSegment)
+      {
+        segCounter++;
+        vty_out (vty, "        path segment %d: as=%d; pcount=%d%s", segCounter,
+                      pathSegment->as, pathSegment->pCount, VTY_NEWLINE);
+        pathSegment = pathSegment->next;
+
+
+        int i;
+        if (sigSegment1)
+        {
+          vty_out (vty, "          signature segment [%d]: block 1, ski=",
+                        segCounter);
+          for (i=0; i < 20; i++)
+          {
+            vty_out (vty, "%02X", sigSegment1->ski[i]);
+          }
+          vty_out (vty, "%s", VTY_NEWLINE);
+          sigSegment1 = sigSegment1->next;
+        }
+
+        if (sigSegment2)
+        {
+          vty_out (vty, "          signature segment [%d]: block 2, ski=",
+                        segCounter);
+          for (i=0; i < 20; i++)
+          {
+            vty_out (vty, "%02X", sigSegment2->ski[i]);
+          }
+          vty_out (vty, "%s", VTY_NEWLINE);
+          sigSegment2 = sigSegment2->next;
+        }
+      }
+    }
+  }
+  else
+  {
+	  vty_out (vty, "      SRx evaluation is deactivated, validation results "
+                  "are ignored!%s", VTY_NEWLINE);
+  }
+}
+#endif /* USE_SRX */
+
 static void
 route_vty_out_detail (struct vty *vty, struct bgp *bgp, struct prefix *p, 
 		      struct bgp_info *binfo, afi_t afi, safi_t safi)
@@ -6245,6 +7667,14 @@ route_vty_out_detail (struct vty *vty, struct bgp *bgp, struct prefix *p,
 	vty_out (vty, ", (suppressed due to dampening)");
       vty_out (vty, "%s", VTY_NEWLINE);
 	  
+#ifdef USE_SRX
+      /* Line1.5 display SRx information */
+  if (CHECK_FLAG(bgp->srx_config, SRX_CONFIG_DISPLAY_INFO))
+  {
+    srx_route_vty_out_detail(vty, bgp, binfo);
+  }
+#endif /* USE_SRX */
+
       /* Line2 display Next-hop, Neighbor, Router-id */
       if (p->family == AF_INET)
 	{
@@ -6380,8 +7810,16 @@ route_vty_out_detail (struct vty *vty, struct bgp *bgp, struct prefix *p,
 #endif /* HAVE_CLOCK_MONOTONIC */
     }
   vty_out (vty, "%s", VTY_NEWLINE);
-}
+}  
 
+#ifdef USE_SRX
+#define BGP_SRX_SHOW_SCODE_HEADER "Validation:    v - valid, n - notfound, i - invalid, ? - undefined%s" \
+                                  "SRx Status:    I - route ignored, D - SRx evaluation deactivated%s" \
+                                  "SRxVal Format: validation result (origin validation, path validation)%s"
+//#define BGP_SRX_SHOW_HEADER       "   SRx Data      Network          Next Hop            Metric  LocPrf Weight Path%s"
+#define BGP_SRX_SHOW_HEADER       "   Ident    SRxVal SRxLP Status Network          Next Hop            Metric  LocPrf Weight Path%s"
+//                                    12345678 i(v,i) +1000   I
+#endif /* USE_SRX */
 #define BGP_SHOW_SCODE_HEADER "Status codes: s suppressed, d damped, "\
 			      "h history, * valid, > best, = multipath,%s"\
 		"              i internal, r RIB-failure, S Stale, R Removed%s"
@@ -6429,6 +7867,10 @@ bgp_show_table (struct vty *vty, struct bgp_table *table, struct in_addr *router
   int display;
   unsigned long output_count;
   unsigned long total_count;
+
+#ifdef USE_SRX
+  int displaySRX = 0;
+#endif /* USE_SRX */
 
   /* This is first entry point, so reset total line. */
   output_count = 0;
@@ -6591,6 +8033,18 @@ bgp_show_table (struct vty *vty, struct bgp_table *table, struct in_addr *router
 	      {
 		vty_out (vty, "BGP table version is 0, local router ID is %s%s", inet_ntoa (*router_id), VTY_NEWLINE);
 		vty_out (vty, BGP_SHOW_SCODE_HEADER, VTY_NEWLINE, VTY_NEWLINE);
+#ifdef USE_SRX
+    if (CHECK_FLAG(ri->peer->bgp->srx_config, SRX_CONFIG_DISPLAY_INFO))
+    {
+      displaySRX = 1;
+      vty_out (vty, BGP_SRX_SHOW_SCODE_HEADER, VTY_NEWLINE, VTY_NEWLINE,
+                    VTY_NEWLINE);
+    }
+    else
+    {
+      displaySRX = 0;
+    }
+#endif /* USE_SRX */
 		vty_out (vty, BGP_SHOW_OCODE_HEADER, VTY_NEWLINE, VTY_NEWLINE);
 		if (type == bgp_show_type_dampend_paths
 		    || type == bgp_show_type_damp_neighbor)
@@ -6607,7 +8061,20 @@ bgp_show_table (struct vty *vty, struct bgp_table *table, struct in_addr *router
 			 || type == bgp_show_type_flap_neighbor)
 		  vty_out (vty, BGP_SHOW_FLAP_HEADER, VTY_NEWLINE);
 		else
+#ifdef USE_SRX
+    {
+      if (displaySRX)
+      {
+        vty_out (vty, BGP_SRX_SHOW_HEADER, VTY_NEWLINE);
+      }
+      else
+      {
+  		  vty_out (vty, BGP_SHOW_HEADER, VTY_NEWLINE);
+      }
+    }
+#else /* USE_SRX */
 		  vty_out (vty, BGP_SHOW_HEADER, VTY_NEWLINE);
+#endif /* USE_SRX */
 		header = 0;
 	      }
 
@@ -7696,7 +9163,7 @@ DEFUN (show_bgp_view_ipv6,
        "Address family\n")
 {
   struct bgp *bgp;
-
+  
   /* BGP structure lookup. */
   bgp = bgp_lookup_by_name (argv[0]);
   if (bgp == NULL)
@@ -9535,7 +11002,7 @@ ALIAS (show_bgp_community,
        "Do not send outside local AS (well-known community)\n"
        "Do not advertise to any peer (well-known community)\n"
        "Do not export to next AS (well-known community)\n")
-
+	
 ALIAS (show_bgp_community,
        show_bgp_community3_cmd,
        "show bgp community (AA:NN|local-AS|no-advertise|no-export) (AA:NN|local-AS|no-advertise|no-export) (AA:NN|local-AS|no-advertise|no-export)",
@@ -9826,7 +11293,7 @@ ALIAS (show_bgp_community_exact,
        "Do not advertise to any peer (well-known community)\n"
        "Do not export to next AS (well-known community)\n"
        "Exact match of the communities")
-
+ 
 ALIAS (show_bgp_community_exact,
        show_bgp_ipv6_community4_exact_cmd,
        "show bgp ipv6 community (AA:NN|local-AS|no-advertise|no-export) (AA:NN|local-AS|no-advertise|no-export) (AA:NN|local-AS|no-advertise|no-export) (AA:NN|local-AS|no-advertise|no-export) exact-match",
@@ -11929,6 +13396,9 @@ enum bgp_pcounts
   PCOUNT_HISTORY,
   PCOUNT_STALE,
   PCOUNT_VALID,
+#ifdef USE_SRX
+  PCOUNT_IGNORE,
+#endif /* USE_SRX */
   PCOUNT_ALL,
   PCOUNT_COUNTED,
   PCOUNT_PFCNT, /* the figure we display to users */
@@ -11943,6 +13413,9 @@ static const char *pcount_strs[] =
   [PCOUNT_HISTORY] = "History",
   [PCOUNT_STALE]   = "Stale",
   [PCOUNT_VALID]   = "Valid",
+#ifdef USE_SRX
+  [PCOUNT_IGNORE]  = "Ignore",
+#endif /* USE_SRX */
   [PCOUNT_ALL]     = "All RIB",
   [PCOUNT_COUNTED] = "PfxCt counted",
   [PCOUNT_PFCNT]   = "Useable",
@@ -11991,6 +13464,12 @@ bgp_peer_count_walker (struct thread *t)
             pc->count[PCOUNT_STALE]++;
           if (CHECK_FLAG (ri->flags, BGP_INFO_VALID))
             pc->count[PCOUNT_VALID]++;
+          #ifdef USE_SRX
+          if (CHECK_FLAG (ri->flags, BGP_INFO_IGNORE))
+          {
+            pc->count[PCOUNT_IGNORE]++;
+          }
+          #endif /* USE_SRX */
           if (!CHECK_FLAG (ri->flags, BGP_INFO_UNUSEABLE))
             pc->count[PCOUNT_PFCNT]++;
           
@@ -12547,6 +14026,7 @@ ALIAS (show_ip_bgp_view_neighbor_received_routes,
        "show ip bgp neighbors (A.B.C.D|X:X::X:X) received-routes",
        SHOW_STR
        IP_STR
+
        BGP_STR
        "Detailed information on TCP and BGP neighbor connections\n"
        "Neighbor to display information about\n"
@@ -12683,6 +14163,9 @@ DEFUN (show_bgp_view_neighbor_received_prefix_filter,
 
   return CMD_SUCCESS;
 }
+
+ 
+
 
 
 DEFUN (show_ip_bgp_ipv4_neighbor_received_routes,
@@ -13747,6 +15230,8 @@ ALIAS (show_bgp_view_ipv4_safi_rsclient_route,
        "Network in the BGP routing table to display\n")
 
 
+
+
 DEFUN (show_bgp_view_ipv4_safi_rsclient_prefix,
        show_bgp_view_ipv4_safi_rsclient_prefix_cmd,
        "show bgp view WORD ipv4 (unicast|multicast) rsclient (A.B.C.D|X:X::X:X) A.B.C.D/M",
@@ -14079,7 +15564,7 @@ DEFUN (show_bgp_view_neighbor_routes,
   return bgp_show_neighbor_route (vty, peer, AFI_IP6, SAFI_UNICAST,
 				  bgp_show_type_neighbor);
 }
-
+       
 ALIAS (show_bgp_view_neighbor_routes,
        show_bgp_neighbor_routes_cmd,
        "show bgp neighbors (A.B.C.D|X:X::X:X) routes",
@@ -16396,6 +17881,7 @@ bgp_route_init (void)
   install_element (VIEW_NODE, &show_ip_bgp_view_rsclient_cmd);
   install_element (VIEW_NODE, &show_ip_bgp_view_rsclient_route_cmd);
   install_element (VIEW_NODE, &show_ip_bgp_view_rsclient_prefix_cmd);
+
   install_element (RESTRICTED_NODE, &show_ip_bgp_route_cmd);
   install_element (RESTRICTED_NODE, &show_ip_bgp_ipv4_route_cmd);
   install_element (RESTRICTED_NODE, &show_ip_bgp_vpnv4_rd_route_cmd);
@@ -16603,8 +18089,10 @@ bgp_route_init (void)
   install_element (ENABLE_NODE, &show_bgp_view_neighbor_flap_cmd);
   install_element (ENABLE_NODE, &show_bgp_view_neighbor_damp_cmd);
   install_element (ENABLE_NODE, &show_bgp_view_rsclient_cmd);
+
   install_element (ENABLE_NODE, &show_bgp_statistics_vpnv4_cmd);
   install_element (ENABLE_NODE, &show_bgp_statistics_view_vpnv4_cmd);
+
   install_element (VIEW_NODE, &show_ipv6_bgp_cmd);
   install_element (VIEW_NODE, &show_ipv6_bgp_route_cmd);
   install_element (VIEW_NODE, &show_ipv6_bgp_prefix_cmd);
@@ -16641,6 +18129,7 @@ bgp_route_init (void)
   install_element (VIEW_NODE, &show_ipv6_mbgp_community_list_cmd);
   install_element (VIEW_NODE, &show_ipv6_mbgp_community_list_exact_cmd);
   install_element (VIEW_NODE, &show_ipv6_mbgp_prefix_longer_cmd);
+
   install_element (ENABLE_NODE, &show_ipv6_bgp_cmd);
   install_element (ENABLE_NODE, &show_ipv6_bgp_route_cmd);
   install_element (ENABLE_NODE, &show_ipv6_bgp_prefix_cmd);
@@ -16707,31 +18196,38 @@ bgp_route_init (void)
   install_element (RESTRICTED_NODE, &show_bgp_ipv6_community3_exact_cmd);
   install_element (RESTRICTED_NODE, &show_bgp_ipv6_community4_exact_cmd);
   install_element (ENABLE_NODE, &show_bgp_ipv6_community_cmd);
+
   install_element (ENABLE_NODE, &show_bgp_ipv6_community2_cmd);
   install_element (ENABLE_NODE, &show_bgp_ipv6_community3_cmd);
   install_element (ENABLE_NODE, &show_bgp_ipv6_community4_cmd);
   install_element (ENABLE_NODE, &show_bgp_ipv6_community_exact_cmd);
   install_element (ENABLE_NODE, &show_bgp_ipv6_community2_exact_cmd);
+
   install_element (ENABLE_NODE, &show_bgp_ipv6_community3_exact_cmd);
   install_element (ENABLE_NODE, &show_bgp_ipv6_community4_exact_cmd);
   install_element (ENABLE_NODE, &show_bgp_ipv6_community_list_exact_cmd);
+
   install_element (VIEW_NODE, &show_bgp_ipv6_community_list_cmd);
   install_element (VIEW_NODE, &show_bgp_ipv6_community_list_exact_cmd);
   install_element (ENABLE_NODE, &show_bgp_ipv6_community_list_cmd);
-
+  
   install_element (VIEW_NODE, &show_bgp_rsclient_route_cmd);
   install_element (VIEW_NODE, &show_bgp_rsclient_prefix_cmd);
   install_element (RESTRICTED_NODE, &show_bgp_rsclient_route_cmd);
+
   install_element (RESTRICTED_NODE, &show_bgp_rsclient_prefix_cmd);
   install_element (ENABLE_NODE, &show_bgp_rsclient_route_cmd);
   install_element (ENABLE_NODE, &show_bgp_rsclient_prefix_cmd);
-
+  
   install_element (VIEW_NODE, &show_bgp_view_rsclient_route_cmd);
   install_element (VIEW_NODE, &show_bgp_view_rsclient_prefix_cmd);
   install_element (RESTRICTED_NODE, &show_bgp_view_rsclient_route_cmd);
   install_element (RESTRICTED_NODE, &show_bgp_view_rsclient_prefix_cmd);
   install_element (ENABLE_NODE, &show_bgp_view_rsclient_route_cmd);
   install_element (ENABLE_NODE, &show_bgp_view_rsclient_prefix_cmd);
+#ifdef USE_SRX
+  thread_add_event (bm->master, initUnSocket, NULL, 0);
+#endif /* USE_SRX */
 }
 
 void

@@ -35,7 +35,9 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 #include "bgpd/bgp_aspath.h"
 #include "bgpd/bgp_debug.h"
 #include "bgpd/bgp_attr.h"
-
+#ifdef USE_SRX
+#include "srx/srx_defs.h"
+#endif /* USE_SRX */
 /* Attr. Flags and Attr. Type Code. */
 #define AS_HEADER_SIZE        2	 
 
@@ -818,6 +820,24 @@ aspath_parse (struct stream *s, size_t length, int use32bit)
    */
   if (length % AS16_VALUE_SIZE )
     return NULL;
+#ifdef USE_SRX
+  if (BGP_DEBUG (as4, AS4_SEGMENT))
+  {
+    size_t i = stream_get_getp (s);
+    zlog_debug ("[AS4SEG] aspath_parse: dump stream length:%d - getp:%d ",\
+               (int)length, stream_getc_from(s, i) );
+    size_t tot = length + i, inc=0;
+    for (i; i < tot; i++)
+    {
+      if (++inc % 16 == 0) 
+      {
+        printf("\n");
+      }
+      printf("%02x ", s->data[i]);
+    }
+    printf(" - from[%s]\n", __FUNCTION__);
+  }
+#endif /* USE_SRX */
 
   memset (&as, 0, sizeof (struct aspath));
   if (assegments_parse (s, length, &as.segments, use32bit) < 0)
@@ -1852,6 +1872,47 @@ aspath_key_make (void *p)
   return key;
 }
 
+#ifdef USE_SRX
+
+/**
+ * Determine the right most as in the path as origin as! In case no ASN can be 
+ * determined according to (RFC 6483) the ASN 65536 which is reserved for 
+ * documentation examples (RFC 5398) is used to prevent any ASN collisions.
+ * 
+ * @param ap The AS path
+ * 
+ * @return the right most AS or 65536 as indicator for unusable ASN. 
+ */
+as_t aspath_origin_as (struct aspath *ap)
+{
+  struct assegment* cseg;
+  as_t oas = 0;
+
+  if (ap == NULL)
+  {
+    return 0;
+  }
+  
+  // take the last element in each segment. At the end the origin is 
+  // written in the oas value.
+  for (cseg = ap->segments; cseg; cseg = cseg->next)
+  {
+    if (cseg->type == AS_SEQUENCE)
+    {
+      oas = cseg->as[cseg->length - 1];
+    }
+    else if (cseg->type == AS_SET)
+    {
+      // AS_SET found, origin cannot be determined (RFC 6483), use an ASN of
+      // rfc 5398 - see srx_defs.h
+      oas = UNKNOWN_ASN;
+      break;
+    }
+  }
+
+  return oas;
+}
+#endif /* USE_SRX */
 /* If two aspath have same value then return 1 else return 0 */
 int
 aspath_cmp (const void *arg1, const void *arg2)

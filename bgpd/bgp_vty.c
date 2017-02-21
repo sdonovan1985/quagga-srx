@@ -19,6 +19,9 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 02111-1307, USA.  */
 
 #include <zebra.h>
+#ifdef USE_SRX
+#include <srx/srxcryptoapi.h>
+#endif
 
 #include "command.h"
 #include "prefix.h"
@@ -50,6 +53,7 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 #include "bgpd/bgp_table.h"
 #include "bgpd/bgp_vty.h"
 #include "bgpd/bgp_mpath.h"
+#include "bgp_validate.h"
 
 extern struct in_addr router_id_zebra;
 
@@ -1483,6 +1487,968 @@ ALIAS (no_bgp_default_local_preference,
        "local preference (higher=more preferred)\n"
        "Configure default local preference value\n")
 
+#ifdef USE_SRX
+DEFUN (srx_show_config,
+       srx_show_config_cmd,
+       SRX_VTY_CMD_SHOW_CONFIG,
+       SRX_VTY_HLP_SHOW_CONFIG)
+{
+  #define _BLANKS "                   "
+  struct bgp *bgp;
+  int doPolicy;
+
+  bgp      = vty->index;
+  doPolicy = 0;
+
+
+  vty_out (vty, "SRx-Server configuration settings:%s", VTY_NEWLINE);
+  vty_out (vty, "  srx-server.....: %s%s", bgp->srx_host, VTY_NEWLINE);
+  vty_out (vty, "  port...........: %d%s", bgp->srx_port, VTY_NEWLINE);
+  vty_out (vty, "  proxy-id.......: 0x%08X (%u.%u.%u.%u - %u)%s",
+           bgp->srx_proxyID,
+           (bgp->srx_proxyID >> 24) & 0xFF,
+           (bgp->srx_proxyID >> 16) & 0xFF,
+           (bgp->srx_proxyID >>  8) & 0xFF,
+           (bgp->srx_proxyID) & 0xFF, bgp->srx_proxyID, VTY_NEWLINE);
+  vty_out (vty, "  keep-window....: %d%s", bgp->srx_keepWindow, VTY_NEWLINE);
+  vty_out (vty, "  connected......: %s%s", (isConnected(bgp->srxProxy)
+                                          ? "true" : "false"), VTY_NEWLINE);
+  
+  vty_out (vty, "BGPSEC configuration settings:%s", VTY_NEWLINE);
+  vty_out (vty, "  active key.....: %u%s", bgp->srx_bgpsec_active_key, 
+           VTY_NEWLINE);
+  int kIdx = 0;
+  int bIdx = 0;
+  char skiStr[SKI_HEX_LENGTH+1];
+  char*skiPtr;
+  for (; kIdx < SRX_MAX_PRIVKEYS; kIdx++)
+  {
+    memset(skiStr, '\0', SKI_HEX_LENGTH+1);
+    skiPtr = skiStr;
+    for (bIdx = 0; bIdx < SKI_LENGTH; bIdx++)
+    {
+      skiPtr += sprintf(skiPtr, "%02X", bgp->srx_bgpsec_key[kIdx].ski[bIdx]);
+    }
+    vty_out (vty, "  Private key %u %sactive%s", kIdx, 
+             bgp->srx_bgpsec_active_key == kIdx ? "- ":"- in", VTY_NEWLINE);
+    vty_out (vty, "  - algorith-id..: %u%s", bgp->srx_bgpsec_key[kIdx].algoID,
+             VTY_NEWLINE);
+    vty_out (vty, "  - ski..........: %s%s", skiStr, VTY_NEWLINE);
+    vty_out (vty, "  - DER-loaded...: %s%s", 
+            bgp->srx_bgpsec_key[kIdx].keyLength > 0 ? "yes":"no", VTY_NEWLINE);
+  }
+  
+  vty_out (vty, "SRx Router Configuration settings:%s", VTY_NEWLINE);  
+  vty_out (vty, "  evaluation.....: ");
+  if (CHECK_FLAG(bgp->srx_config, SRX_CONFIG_EVAL_PATH))
+  {
+    vty_out (vty, "bgpsec (prefix-origin and path processing)%s", VTY_NEWLINE);
+  }
+  else if (CHECK_FLAG(bgp->srx_config, SRX_CONFIG_EVAL_ORIGIN))
+  {
+    vty_out (vty, "origin_only (prefix-origin processing)%s", VTY_NEWLINE);
+  }
+  else
+  {
+    vty_out (vty, "disabled!%s", VTY_NEWLINE);
+  }
+
+  // Default value for origin validation
+  vty_out (vty, "  default value..: (origin) ");
+  switch (bgp->srx_default_roaVal)
+  {
+    case SRx_RESULT_VALID:
+      vty_out (vty, "  v = valid%s", VTY_NEWLINE); break;
+    case SRx_RESULT_NOTFOUND:
+      vty_out (vty, "  n = notfound%s", VTY_NEWLINE); break;
+    case SRx_RESULT_INVALID:
+      vty_out (vty, "  i = invalid%s", VTY_NEWLINE); break;
+    case SRx_RESULT_UNDEFINED:
+      vty_out (vty, "  ? = undefined%s", VTY_NEWLINE); break;
+    default:
+      vty_out (vty, "  invalid value%s", VTY_NEWLINE);
+  }
+
+  // Default value for path validation
+  vty_out (vty, "  default value..: ( path ) ");
+  switch (bgp->srx_default_bgpsecVal)
+  {
+    case SRx_RESULT_VALID:
+      vty_out (vty, "  v = valid%s", VTY_NEWLINE); break;
+    case SRx_RESULT_INVALID:
+      vty_out (vty, "  i = invalid%s", VTY_NEWLINE); break;
+    case SRx_RESULT_UNDEFINED:
+      vty_out (vty, "  ? = undefined%s", VTY_NEWLINE); break;
+    default:
+      vty_out (vty, "  invalid value%s", VTY_NEWLINE);
+  }
+
+   // always active
+  vty_out (vty, "  policy.........: ");
+  if (bgp->srx_val_policy & SRX_VAL_POLICY_IGNORE_NOTFOUND)
+  {
+    vty_out (vty, "%signore-notfound%s", (doPolicy ? _BLANKS : ""),VTY_NEWLINE);
+    doPolicy = 1;
+  }
+  if (bgp->srx_val_policy & SRX_VAL_POLICY_IGNORE_INVALID)
+  {
+    vty_out (vty, "%signore-invalid%s", (doPolicy ? _BLANKS : ""), VTY_NEWLINE);
+    doPolicy = 1;
+  }
+  if (bgp->srx_val_policy & SRX_VAL_POLICY_IGNORE_UNDEFINED)
+  {
+    vty_out (vty, "%signore-undefined%s", (doPolicy ? _BLANKS : ""),
+             VTY_NEWLINE);
+    doPolicy = 1;
+  }
+  if (bgp->srx_val_local_pref[VAL_LOCPRF_VALID].is_set)
+  {
+    vty_out (vty, "%slocal-preference valid %d", (doPolicy ? _BLANKS : ""),
+                  bgp->srx_val_local_pref[VAL_LOCPRF_VALID].value);
+    switch (bgp->srx_val_local_pref[VAL_LOCPRF_VALID].relative)
+    {
+      case -1 : vty_out (vty, " SUBTRACT%s", VTY_NEWLINE); break;
+      case  1 : vty_out (vty, " ADD%s", VTY_NEWLINE); break;
+      default: vty_out (vty, "%s", VTY_NEWLINE);
+    }
+    doPolicy = 1;
+  }
+  if (bgp->srx_val_local_pref[VAL_LOCPRF_NOTFOUND].is_set)
+  {
+    vty_out (vty, "%slocal-preference notfound %d", (doPolicy ? _BLANKS : ""),
+                  bgp->srx_val_local_pref[VAL_LOCPRF_NOTFOUND].value);
+    switch (bgp->srx_val_local_pref[VAL_LOCPRF_NOTFOUND].relative)
+    {
+      case -1 : vty_out (vty, " SUBTRACT%s", VTY_NEWLINE); break;
+      case  1 : vty_out (vty, " ADD%s", VTY_NEWLINE); break;
+      default: vty_out (vty, "%s", VTY_NEWLINE);
+    }
+    doPolicy = 1;
+  }
+  if (bgp->srx_val_local_pref[VAL_LOCPRF_INVALID].is_set)
+  {
+    vty_out (vty, "%slocal-preference invalid %d", (doPolicy ? _BLANKS : ""),
+                  bgp->srx_val_local_pref[VAL_LOCPRF_INVALID].value);
+    switch (bgp->srx_val_local_pref[VAL_LOCPRF_INVALID].relative)
+    {
+      case -1 : vty_out (vty, " SUBTRACT%s", VTY_NEWLINE); break;
+      case  1 : vty_out (vty, " ADD%s", VTY_NEWLINE); break;
+      default: vty_out (vty, "%s", VTY_NEWLINE);
+    }
+    doPolicy = 1;
+  }
+  if (bgp->srx_val_policy & SRX_VAL_POLICY_PREFER_VALID)
+  {
+    vty_out (vty, "%sprefer-valid%s", (doPolicy ? _BLANKS : ""), VTY_NEWLINE);
+    doPolicy = 1;
+  }
+  if (doPolicy == 0)
+  {
+    vty_out (vty, "%s", VTY_NEWLINE);
+  }
+
+  if (CHECK_FLAG(bgp->srx_ecommunity_flags,SRX_BGP_FLAG_ECOMMUNITY))
+  {
+    vty_out (vty, "  ext community..: %d%s", bgp->srx_ecommunity_subcode,
+                                             VTY_NEWLINE);
+    vty_out (vty, "  incl-eBGP......: %s%s",
+             (CHECK_FLAG(bgp->srx_ecommunity_flags,SRX_BGP_FLAG_ECOMMUNITY_EBGP)
+             ? "true" : "false"), VTY_NEWLINE);
+  }
+  else
+  {
+    vty_out (vty, "  ext community..: off%s", VTY_NEWLINE);
+  }
+
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_set_server,
+       srx_set_server_cmd,
+       SRX_VTY_CMD_SET_SERVER,
+       SRX_VTY_HLP_SET_SERVER)
+{
+  struct bgp *bgp;
+  int port;
+
+  bgp = vty->index;
+
+  if (argc != 2)
+  {
+    return CMD_ERR_INCOMPLETE;
+  }
+
+  /* Host name */
+  if (strlen(argv[SRX_VTY_PARAM_CONNECT_SRV]) == 0)
+  {
+    vty_out (vty, "%% Empty SRx host name%s", VTY_NEWLINE);
+    return CMD_WARNING;
+  }
+
+  /* Port number */
+  VTY_GET_INTEGER_RANGE ("Port", port, argv[SRX_VTY_PARAM_CONNECT_PORT],
+                         1, 65535);
+
+  /* Set configuration */
+  return bgp_srx_set (bgp, vty, argv[SRX_VTY_PARAM_CONNECT_SRV], port, false);
+}
+
+DEFUN (srx_connect_short,
+       srx_connect_short_cmd,
+       SRX_VTY_CMD_CONNECT_SHORT,
+       SRX_VTY_HLP_CONNECT_SHORT)
+{
+  struct bgp *bgp;
+  bgp = vty->index;
+
+  /* Host name */
+  if (bgp->srx_host == NULL)
+  {
+    vty_out (vty, "%% SRx host name not defined, use \"%s\" or pass server and "
+                  "port with this command%s",
+                  SRX_VTY_CMD_SET_SERVER_SHORT, VTY_NEWLINE);
+    return CMD_WARNING;
+  }
+
+  if (strlen(bgp->srx_host) == 0)
+  {
+    vty_out (vty, "Empty SRx host name%s", VTY_NEWLINE);
+    return CMD_WARNING;
+  }
+
+  /* Port number */
+  if (bgp->srx_port == 0)
+  {
+    vty_out (vty, "%% SRx port not specified!%s", VTY_NEWLINE);
+    return CMD_WARNING;
+  }
+
+  /* Set configuration */
+  return bgp_srx_set (bgp, vty, bgp->srx_host, bgp->srx_port, true);
+}
+
+/**
+ * This function sets the key for the given ski.
+ * 
+ * @param vty The vty
+ * @param skiNum The ski that is being used - 0 or 1
+ * @param algoID The algorithm ID of the used key.
+ * 
+ * @return CMD_SUCCESS, CMD_WARNING, or CMD_ERR_INCOMPLETE
+ */
+int srx_set_ski(struct vty* vty, u_int8_t skiNum, char* skiStr, u_int8_t algoID)
+{
+  int retVal = CMD_SUCCESS;
+  struct bgp* bgp = vty->index;
+  
+  if (strlen(skiStr) != SKI_HEX_LENGTH)
+  {
+    vty_out (vty, "SKI must be exact 20 bytes ASCII %s", VTY_NEWLINE);
+    return CMD_ERR_INCOMPLETE;
+  }
+  if (skiNum >= SRX_MAX_PRIVKEYS)
+  {
+    vty_out (vty, "Select an ski between 0..%u, The selected ski %u is outside of there boundaries", 
+             SRX_MAX_PRIVKEYS-1, skiNum, VTY_NEWLINE);
+    return CMD_ERR_INCOMPLETE;    
+  }
+
+  // The array index starts by zero "0" but the key numbering by one "1"  
+  BGPSecKey* key = &bgp->srx_bgpsec_key[skiNum];
+  if (key->keyLength > 0)
+  {
+    // A previous key was loaded, remove it and load the new one.
+    if (bgp->srxCAPI != NULL)
+    {
+      sca_status_t keyStatus = API_STATUS_OK;
+      if (bgp->srxCAPI->unregisterPrivateKey(key, &keyStatus) == API_FAILURE)
+      {
+        vty_out (vty, "Removal of previous router key '%s' failed (status:0x%X)!%s", 
+                 skiStr, keyStatus, VTY_NEWLINE);
+      }
+      else
+      {
+        vty_out (vty, "Old router key '%s' successfully removed!%s", 
+                 skiStr, VTY_NEWLINE);
+      }
+    }
+    
+    // Free previously set values.
+    free(key->keyData);
+    key->keyData   = NULL;
+    key->keyLength = 0;
+  }
+  
+  // @TODO: This value should va
+  key->algoID = algoID;
+  key->asn    = htonl(bgp->as);
+  memset(key->ski, 0, SKI_LENGTH);
+  
+  // Now set the key ski values
+  int max = strlen(skiStr) < SKI_LENGTH ? strlen(skiStr) : SKI_LENGTH; 
+  int idx = 0;
+  char* ch = skiStr;
+  for (; idx < max; idx++)
+  {
+    key->ski[idx] = hex2bin_byte(ch);
+    ch += 2;
+  }
+  
+  
+  // First try to load the key, if this fails we cannot register.
+  sca_status_t keyStatus = API_STATUS_OK;
+  if (sca_loadKey(key, true, &keyStatus) == API_SUCCESS)
+  {
+    // Now register the private key
+    if (bgp->srxCAPI != NULL)
+    {
+      if (bgp->srxCAPI->registerPrivateKey(key, &keyStatus) == API_FAILURE)
+      {
+        zlog_err ("Installation of router key: #%u, algorithm-id: %u, ski: '%s' failed (status:0x%X)!\n", 
+                   skiNum, algoID, skiStr, keyStatus);
+        vty_out (vty, "Installation of router key: #%u, algorithm-id: %u, ski: '%s' failed (status:0x%X)!%s", 
+                 skiNum, algoID, skiStr, keyStatus, VTY_NEWLINE);
+        retVal = CMD_WARNING;
+      }
+      else
+      {
+        zlog_info ("Router key: #%u, algorithm-id: %u, ski: '%s' successfully installed!\n", 
+                   skiNum, algoID, skiStr);
+        vty_out (vty, "Router key: #%u, algorithm-id: %u, ski: '%s' successfully installed!%s", 
+                 skiNum, algoID, skiStr, VTY_NEWLINE);
+      }    
+    }
+    else
+    {
+      zlog_warn ("Cannot install router key '%s', crypto api not available!", 
+                 skiStr);
+      vty_out (vty, "Cannot install router key '%s', crypto api not available!%s", 
+               skiStr, VTY_NEWLINE);
+      
+      retVal = CMD_WARNING;
+    }  
+  }
+  else
+  {
+    zlog_warn ("Router key %u '%s' not found in key_volt - Check configuration of SRxCryptoAPI!", 
+             skiNum, skiStr);        
+    vty_out (vty, "Router key %u '%s' not found in key_volt - Check configuration of SRxCryptoAPI!%s", 
+             skiNum, skiStr, VTY_NEWLINE);
+    retVal = CMD_WARNING;
+  }
+  
+  return retVal;
+}
+
+/** 
+ * This function is deprecated and just kept for compatibility 
+ * I did not ALIAS it to allow printing out a deprecation message.
+ */
+DEFUN (bgpsec_ski,
+       bgpsec_ski_cmd,
+       SRX_VTY_CMD_BGPSEC_DEP_SKI,
+       SRX_VTY_HLP_BGPSEC_DEP_SKI)
+{
+  struct bgp *bgp;
+  bgp = vty->index;
+
+  if (argc != 1)
+  {
+    return CMD_ERR_INCOMPLETE;
+  }
+  
+  vty_out(vty, "WARNING: The configuration command '%s' is deprecated! Use '%s %s' instead %s", 
+          SRX_VTY_CMD_BGPSEC_DEP_SKI_PRNT, SRX_VTY_CMD_BGPSEC_SKI_PRNT, argv[0], 
+          VTY_NEWLINE);
+  zlog_warn("The configuration command '%s' is deprecated! Use '%s %s' instead %s", 
+          SRX_VTY_CMD_BGPSEC_DEP_SKI_PRNT, SRX_VTY_CMD_BGPSEC_SKI_PRNT, argv[0], 
+          VTY_NEWLINE);
+
+  // in this old setting mode, we store it as the first key only.
+  bgp->srx_bgpsec_active_key = 0;  
+  return srx_set_ski(vty, bgp->srx_bgpsec_active_key, (char*)argv[0], 
+                     SCA_ECDSA_ALGORITHM);
+}
+
+// THIS COMMMAND IS NOT IN USE ANYMORE
+DEFUN (bgpsec_sign,
+       bgpsec_sign_cmd,
+       SRX_VTY_CMD_BGPSEC_DEP_SIGN,
+       SRX_VTY_HLP_BGPSEC_DEP_SIGN)
+{
+  vty_out(vty, "This command does not have any affect anymore - remove it.%s", 
+          VTY_NEWLINE);    
+    
+  return CMD_WARNING;
+}
+
+DEFUN (srx_bgpsec_ski,
+       srx_bgpsec_ski_cmd,
+       SRX_VTY_CMD_BGPSEC_SKI,
+       SRX_VTY_HLP_BGPSEC_SKI)
+{
+  struct bgp *bgp;
+  bgp = vty->index;
+
+  if (argc != 3)
+  {
+    return CMD_ERR_INCOMPLETE;
+  }
+  
+  // in this old setting mode, we store it as the first key only.
+  uint32_t skiNum = (uint32_t)atoi(argv[0]);
+  int      algoID = atoi(argv[1]);
+  char*    skiStr = (char*)argv[2];
+  int retVal = CMD_ERR_INCOMPLETE;
+  if (skiNum >= SRX_MAX_PRIVKEYS)
+  {
+    zlog_err("This provided ski number is outside of the accepted boundaries%s", 
+            VTY_NEWLINE);    
+    vty_out(vty, "This provided ski number is outside of the accepted boundaries%s", 
+            VTY_NEWLINE);    
+  }
+  else
+  {
+    if (   (algoID < SRX_VTY_PARAM_BGPSEC_MIN_ALGOID) 
+        || (algoID > SRX_VTY_PARAM_BGPSEC_MAX_ALGOID))
+    {
+      zlog_err("This provided algorithm identifier is outside of the accepted boundaries%s", 
+              VTY_NEWLINE);    
+      vty_out(vty, "This provided algorithm identifier is outside of the accepted boundaries%s", 
+              VTY_NEWLINE);    
+    }
+    else
+    {
+      retVal = srx_set_ski(vty, skiNum, skiStr, algoID);
+    }
+  }
+  
+  return retVal;
+}
+
+DEFUN (srx_bgpsec_active_ski,
+       srx_bgpsec_active_ski_cmd,
+       SRX_VTY_CMD_BGPSEC_ACTIVE_SKI,
+       SRX_VTY_HLP_BGPSEC_ACTIVE_SKI)
+{
+  struct bgp *bgp;
+  bgp = vty->index;
+
+  if (argc != 1)
+  {
+    return CMD_ERR_INCOMPLETE;
+  }
+  
+  int retVal = CMD_SUCCESS;
+  
+  uint32_t activeNum = (uint32_t)atoi(argv[0]);
+  if (activeNum >= SRX_MAX_PRIVKEYS)
+  {
+    vty_out(vty, "This provided ski number is outside of the accepted boundaries%s", 
+            VTY_NEWLINE);
+    retVal = CMD_ERR_INCOMPLETE;
+  }
+  else
+  {
+    bgp->srx_bgpsec_active_key = activeNum;
+  }
+  
+  return retVal;
+}
+
+DEFUN (srx_bgpsec_register_pkeys,
+       srx_bgpsec_register_pkeys_cmd,
+       SRX_VTY_CMD_BGPSEC_REGISTER_P_KEYS,
+       SRX_VTY_HLP_BGPSEC_REGISTER_P_KEYS)
+{
+  struct bgp *bgp;
+  bgp = vty->index;
+
+  if (argc != 1)
+  {
+    return CMD_ERR_INCOMPLETE;
+  }
+  
+  int retVal = CMD_SUCCESS;
+  
+  // Check if the keys are available in DER format and if not use the srx-crytpao-api
+  // to load them.
+  int kIdx = 0;
+  for (; kIdx < SRX_MAX_PRIVKEYS; kIdx++)
+  {
+    if (bgp->srx_bgpsec_key[kIdx].keyLength = 0)
+    {
+      sca_status_t myStatus = API_STATUS_OK;
+      if (sca_loadKey(&bgp->srx_bgpsec_key[kIdx], true, &myStatus) == API_FAILURE)
+      {
+        zlog_warn ("Router key %u not found in key_volt (status: 0x%X) - Check configuration of SRxCryptoAPI!", 
+                   kIdx, myStatus);        
+        vty_out (vty, "Router key %u not found in key_volt (status: 0x%X) - Check configuration of SRxCryptoAPI!%s", 
+                 kIdx, myStatus, VTY_NEWLINE);
+        retVal = CMD_WARNING;
+      }
+    }
+  }
+  
+  // Now register the keys (again)
+  if (bgp->srxCAPI != NULL)
+  {
+    for (kIdx = 0; kIdx < SRX_MAX_PRIVKEYS; kIdx++)
+    {
+      sca_status_t keyStatus = API_STATUS_OK;
+      if (bgp->srxCAPI->registerPrivateKey(&bgp->srx_bgpsec_key[kIdx], &keyStatus) == API_FAILURE)
+      {
+        zlog_err ("Installation of router key %u failed (status:0x%X)!", 
+                   kIdx, keyStatus);
+        vty_out (vty, "Installation of router key %u failed (status:0x%X)!%s", 
+                 kIdx, keyStatus, VTY_NEWLINE);        
+      }
+    }
+  }
+  else
+  {
+    {
+      zlog_warn ("Cannot install router keys, crypto api not available!");
+      vty_out (vty, "Cannot install router keys, crypto api not available!%s", 
+               VTY_NEWLINE);
+      
+      retVal = CMD_WARNING;
+    }      
+  }
+  return retVal;
+}
+
+DEFUN (srx_connect,
+       srx_connect_cmd,
+       SRX_VTY_CMD_CONNECT,
+       SRX_VTY_HLP_CONNECT)
+{
+  struct bgp *bgp;
+  int port;
+
+  bgp = vty->index;
+
+  /* Make sure both parameters are given, not only the host */
+  if (argc != 2)
+  {
+    return CMD_ERR_INCOMPLETE;
+  }
+
+  /* Host name */
+  if (strlen(argv[SRX_VTY_PARAM_CONNECT_SRV]) == 0)
+  {
+    vty_out (vty, "%% Empty SRx host name%s", VTY_NEWLINE);
+    return CMD_ERR_INCOMPLETE;
+  }
+
+  /* Port number */
+  VTY_GET_INTEGER_RANGE ("Port", port, argv[SRX_VTY_PARAM_CONNECT_PORT],
+                         1, 65535);
+
+  /* Set configuration */
+  return bgp_srx_set (bgp, vty, argv[SRX_VTY_PARAM_CONNECT_SRV], port, true);
+}
+
+DEFUN (srx_disconnect,
+       srx_disconnect_cmd,
+       SRX_VTY_CMD_DISCONNECT,
+       SRX_VTY_HLP_DISCONNECT)
+{
+  struct bgp *bgp;
+
+  bgp = vty->index;
+  bgp_srx_unset (bgp);
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_evaluation,
+       srx_evaluation_cmd,
+       SRX_VTY_CMD_EVALUATE,
+       SRX_VTY_HLP_EVALUATE)
+{
+  struct bgp* bgp;
+  int mode;
+
+  bgp = vty->index;
+  mode = SRX_CONFIG_EVAL_ORIGIN;
+  if (strncmp(argv[0], SRX_VTY_EVAL_BGPSEC, 1) == 0)
+  {
+    mode |= SRX_CONFIG_EVAL_PATH;
+  }
+
+  bgp_srx_evaluation(bgp, mode);
+  return CMD_SUCCESS;
+}
+
+// Configuration of default validation results
+DEFUN (srx_conf_default_roa_result_valid,
+       srx_conf_default_roa_result_valid_cmd,
+       SRX_VTY_CMD_CONF_DEF_ROA_RES_VALID,
+       SRX_VTY_HLP_CONF_DEF_ROA_RES_VALID)
+{
+  struct bgp* bgp;
+  bgp = vty->index;
+  bgp_srx_conf_default_result (bgp, SRX_VTY_PARAM_ORIGIN_VALUE,
+                               SRx_RESULT_VALID);
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_conf_default_roa_result_unknown,
+       srx_conf_default_roa_result_unknown_cmd,
+       SRX_VTY_CMD_CONF_DEF_ROA_RES_NOTFOUND,
+       SRX_VTY_HLP_CONF_DEF_ROA_RES_NOTFOUND)
+{
+  struct bgp* bgp;
+  bgp = vty->index;
+  bgp_srx_conf_default_result (bgp, SRX_VTY_PARAM_ORIGIN_VALUE,
+                               SRx_RESULT_NOTFOUND);
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_conf_default_roa_result_invalid,
+       srx_conf_default_roa_result_invalid_cmd,
+       SRX_VTY_CMD_CONF_DEF_ROA_RES_INVALID,
+       SRX_VTY_HLP_CONF_DEF_ROA_RES_INVALID)
+{
+  struct bgp* bgp;
+  bgp = vty->index;
+  bgp_srx_conf_default_result (bgp, SRX_VTY_PARAM_ORIGIN_VALUE,
+                               SRx_RESULT_INVALID);
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_conf_default_roa_result_undefined,
+       srx_conf_default_roa_result_undefined_cmd,
+       SRX_VTY_CMD_CONF_DEF_ROA_RES_UNDEFINED,
+       SRX_VTY_HLP_CONF_DEF_ROA_RES_UNDEFINED)
+{
+  struct bgp* bgp;
+  bgp = vty->index;
+  bgp_srx_conf_default_result (bgp, SRX_VTY_PARAM_ORIGIN_VALUE,
+                               SRx_RESULT_UNDEFINED);
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_conf_default_path_result_valid,
+       srx_conf_default_path_result_valid_cmd,
+       SRX_VTY_CMD_CONF_DEF_PATH_RES_VALID,
+       SRX_VTY_HLP_CONF_DEF_PATH_RES_VALID)
+{
+  struct bgp* bgp;
+  bgp = vty->index;
+  bgp_srx_conf_default_result (bgp, SRX_VTY_PARAM_PATH_VALUE,
+                               SRx_RESULT_VALID);
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_conf_default_path_result_invalid,
+       srx_conf_default_path_result_invalid_cmd,
+       SRX_VTY_CMD_CONF_DEF_PATH_RES_INVALID,
+       SRX_VTY_HLP_CONF_DEF_PATH_RES_INVALID)
+{
+  struct bgp* bgp;
+  bgp = vty->index;
+  bgp_srx_conf_default_result (bgp, SRX_VTY_PARAM_PATH_VALUE,
+                               SRx_RESULT_INVALID);
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_conf_default_path_result_undefined,
+       srx_conf_default_path_result_undefined_cmd,
+       SRX_VTY_CMD_CONF_DEF_PATH_RES_UNDEFINED,
+       SRX_VTY_HLP_CONF_DEF_PATH_RES_UNDEFINED)
+{
+  struct bgp* bgp;
+  bgp = vty->index;
+  bgp_srx_conf_default_result (bgp, SRX_VTY_PARAM_PATH_VALUE,
+                               SRx_RESULT_UNDEFINED);
+  return CMD_SUCCESS;
+}
+
+// Configuration of evaluation algorithm
+DEFUN (no_srx_evaluation,
+       no_srx_evaluation_cmd,
+       SRX_VTY_CMD_NO_EVALUATE,
+       SRX_VTY_HLP_NO_EVALUATE)
+{
+  struct bgp *bgp;
+
+  bgp = vty->index;
+  bgp_srx_evaluation (bgp, 0);
+  return CMD_SUCCESS;
+}
+
+// This command is disabled
+DEFUN (srx_apply_policy,
+       srx_apply_policy_cmd,
+       SRX_VTY_CMD_APPLY_POLICY,
+       SRX_VTY_HLP_APPLY_POLICY)
+{
+  struct bgp *bgp;
+
+  bgp = vty->index;
+  zlog_debug("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+  srx_bgp_requeue_all(bgp);
+  return CMD_SUCCESS;
+}
+
+// Disabled for this prototype. srx_display_cmd is not installed.
+//
+DEFUN (srx_display,
+       srx_display_cmd,
+       SRX_VTY_CMD_DISPLAY,
+       SRX_VTY_HLP_DISPLAY)
+{
+  struct bgp *bgp;
+
+  bgp = vty->index;
+  bgp_srx_display (bgp, 1);
+  return CMD_SUCCESS;
+}
+
+DEFUN (no_srx_display,
+       no_srx_display_cmd,
+       "no " SRX_VTY_CMD_DISPLAY,
+       NO_STR
+       SRX_VTY_HLP_DISPLAY_NO)
+{
+  struct bgp *bgp;
+
+  bgp = vty->index;
+  bgp_srx_display (bgp, 0);
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_keepwindow,
+       srx_keepwindow_cmd,
+       SRX_VTY_CMD_KEEPWINDOW,
+       SRX_VTY_HLP_KEEPWINDOW)
+{
+  struct bgp *bgp;
+
+
+  bgp = vty->index;
+  bgp->srx_keepWindow = strtoul (argv[0], NULL, 10);
+
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_proxyid,
+       srx_proxyid_cmd,
+       SRX_VTY_CMD_PROXYID,
+       SRX_VTY_HLP_PROXYID)
+{
+  struct bgp *bgp = vty->index;
+  struct in_addr address;
+  uint32_t hAddress = 0;
+
+  if (inet_aton(argv[0], &address) != 0)
+  {
+    hAddress = address.s_addr;
+  }
+  else
+  {
+	  vty_out (vty, "%% Malformed proxy id (%s). Use A.B.C.D format%s",
+                  argv[0], VTY_NEWLINE);
+    return CMD_WARNING;
+  }
+
+  int retVal = srx_set_proxyID(bgp, ntohl(hAddress));
+  // Now check if setting the proxy id succeeded or not
+  if (retVal != CMD_SUCCESS)
+  {
+    hAddress = htonl(bgp->srxProxy->proxyID);
+	  vty_out (vty, "%% Proxy is already connected to SRx server using proxy id "
+                  "%u.%u.%u.%u (%u). Can not change proxy-id as long as proxy "
+                  "is connected!%s", (hAddress >> 24) & 0xFF,
+                  (hAddress >> 16) & 0xFF, (hAddress >> 8) & 0xFF,
+                  hAddress & 0xFF, hAddress, VTY_NEWLINE);
+  }
+
+  return retVal;
+}
+
+/**
+ *  Scan for the validation result "v" for valid, "u" for unknown, otherwise
+ * invalid.
+ *
+ * @param str The local pref validation string (valid, unknown, or invalid)
+ *
+ * @return the index type VAL_LOCPRF_VALID,VAL_LOCPRF_NOTFOUND, or
+ *         VAL_LOCPRF_INVALID
+ */
+static int parse_local_pref_index (const char *str)
+{
+  if (strncmp (str, "v", 1) == 0)
+  {
+    return VAL_LOCPRF_VALID;
+  }
+  return (strncmp (str, "n", 1) == 0) ? VAL_LOCPRF_NOTFOUND
+                                      : VAL_LOCPRF_INVALID;
+}
+
+/**
+ * Set the local pref policy
+ *
+ * @param argc the number of arguments passed
+ * @param type the argument array
+ * @param bgp the bgp struct
+ * @param set 1 == set the value, otherwise unset
+ * @return if the command could be executed successfully
+ */
+static int validation_local_preference(int argc, const char** argv,
+                                       struct bgp* bgp, int set)
+{
+  int index, relative;
+  uint32_t lp_val;
+
+  index  = parse_local_pref_index (argv[0]);
+
+  if (set == 1)
+  {
+    lp_val = strtoul (argv[1], NULL, 10);
+
+    if (argc == 2)
+      relative = 0;
+    else
+      relative = (strncmp (argv[2], "a", 1) == 0) ? 1 : -1;
+
+    srx_val_local_preference_set (bgp, index, relative, lp_val);
+  }
+  else
+  {
+    srx_val_local_preference_unset (bgp, index);
+  }
+  return CMD_SUCCESS;
+}
+
+DEFUN (srx_policy_local_preference_var,
+       srx_policy_local_preference_var_cmd,
+       SRX_VTY_CMD_POL_LOCP_VAR,
+       SRX_VTY_HLP_POL_LOCP_VAR
+       )
+{
+  return validation_local_preference(argc, argv, vty->index, 1);
+}
+
+DEFUN (srx_policy_local_preference_fix,
+       srx_policy_local_preference_fix_cmd,
+       SRX_VTY_CMD_POL_LOCP_FIX,
+       SRX_VTY_HLP_POL_LOCP_FIX
+       )
+{
+  return validation_local_preference(argc, argv, vty->index, 1);
+}
+
+DEFUN (no_srx_policy_local_preference,
+       no_srx_policy_local_preference_cmd,
+       SRX_VTY_CMD_NO_POL_LOCP,
+       SRX_VTY_HLP_NO_POL_LOCP
+       )
+{
+  return validation_local_preference(argc, argv, vty->index, 0);
+}
+
+DEFUN (srx_policy_ignore_notfound,
+       srx_policy_ignore_notfound_cmd,
+       SRX_VTY_CMD_POL_IGNORE_NOTFOUND,
+       SRX_VTY_HLP_POL_IGNORE_NOTFOUND)
+{
+  srx_val_policy_set (vty->index, SRX_VAL_POLICY_IGNORE_NOTFOUND);
+  return  CMD_SUCCESS;
+}
+
+DEFUN (no_srx_policy_ignore_notfound,
+       no_srx_policy_ignore_notfound_cmd,
+       "no " SRX_VTY_CMD_POL_IGNORE_NOTFOUND,
+       NO_STR
+       SRX_VTY_HLP_POL_IGNORE_NOTFOUND)
+{
+  srx_val_policy_unset (vty->index, SRX_VAL_POLICY_IGNORE_NOTFOUND);
+  return  CMD_SUCCESS;
+}
+
+DEFUN (srx_policy_ignore_invalid,
+       srx_policy_ignore_invalid_cmd,
+       SRX_VTY_CMD_POL_IGNORE_INVALID,
+       SRX_VTY_HLP_POL_IGNORE_INVALID)
+{
+  srx_val_policy_set (vty->index, SRX_VAL_POLICY_IGNORE_INVALID);
+  return  CMD_SUCCESS;
+}
+
+DEFUN (no_srx_policy_ignore_invalid,
+       no_srx_policy_ignore_invalid_cmd,
+       "no " SRX_VTY_CMD_POL_IGNORE_INVALID,
+       NO_STR
+       SRX_VTY_HLP_POL_IGNORE_INVALID)
+{
+  srx_val_policy_unset (vty->index, SRX_VAL_POLICY_IGNORE_INVALID);
+  return  CMD_SUCCESS;
+}
+
+DEFUN (srx_policy_ignore_undefined,
+       srx_policy_ignore_undefined_cmd,
+       SRX_VTY_CMD_POL_IGNORE_UNDEFINED,
+       SRX_VTY_HLP_POL_IGNORE_UNDEFINED)
+{
+  srx_val_policy_set (vty->index, SRX_VAL_POLICY_IGNORE_UNDEFINED);
+  return  CMD_SUCCESS;
+}
+
+DEFUN (no_srx_policy_ignore_undefined,
+       no_srx_policy_ignore_undefined_cmd,
+       "no " SRX_VTY_CMD_POL_IGNORE_UNDEFINED,
+       NO_STR
+       SRX_VTY_HLP_POL_IGNORE_UNDEFINED)
+{
+  srx_val_policy_unset (vty->index, SRX_VAL_POLICY_IGNORE_UNDEFINED);
+  return  CMD_SUCCESS;
+}
+
+DEFUN (srx_policy_prefer_valid,
+       srx_policy_prefer_valid_cmd,
+       SRX_VTY_CMD_POL_PREFV,
+       SRX_VTY_HLP_POL_PREFV)
+{
+  return srx_val_policy_set (vty->index, SRX_VAL_POLICY_PREFER_VALID);
+}
+
+DEFUN (no_srx_policy_prefer_valid,
+       no_srx_policy_prefer_valid_cmd,
+       "no " SRX_VTY_CMD_POL_PREFV,
+       NO_STR
+       SRX_VTY_HLP_POL_PREFV)
+{
+  return srx_val_policy_unset (vty->index, SRX_VAL_POLICY_PREFER_VALID);
+}
+
+DEFUN (srx_send_extcommunity,
+       srx_send_extcommunity_cmd,
+       SRX_VTY_CMD_EXT_CSTR,
+       SRX_VTY_HLP_EXT_CSTR)
+{
+  return srx_extcommunity_set (vty->index, atoi(argv[0]), "");
+}
+
+DEFUN (srx_send_extcommunity_ebgp,
+       srx_send_extcommunity_ebgp_cmd,
+       SRX_VTY_CMD_EXT_CSTR_EBGP,
+       SRX_VTY_HLP_EXT_CSTR_EBGP)
+{
+  return srx_extcommunity_set (vty->index, atoi(argv[0]), argv[1]);
+}
+
+DEFUN (no_srx_send_extcommunity,
+       no_srx_send_extcommunity_cmd,
+       SRX_VTY_CMD_NO_EXT_CSTR,
+       NO_STR
+       SRX_VTY_HLP_NO_EXT_CSTR)
+{
+  return srx_extcommunity_unset(vty->index);
+}
+#endif /* USE_SRX */
+
 static int
 peer_remote_as_vty (struct vty *vty, const char *peer_str, 
                     const char *as_str, afi_t afi, safi_t safi)
@@ -2061,6 +3027,107 @@ DEFUN (no_neighbor_dont_capability_negotiate,
 {
   return peer_flag_unset_vty (vty, argv[0], PEER_FLAG_DONT_CAPABILITY);
 }
+
+#ifdef USE_SRX
+// @TODO: Create defines for that and add them to the other ones.
+/* bgpsec neighbor capability */
+DEFUN (neighbor_capability_bgpsec,
+       neighbor_capability_bgpsec_cmd,
+       SRX_VTY_CMD_NEIGHBOR_BGPSEC_MODE,
+       SRX_VTY_HLP_NEIGHBOR_BGPSEC_MODE)
+{
+  u_int16_t flag = 0;
+
+  if (strncmp (argv[1], "s", 1) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_CAPABILITY_SEND | PEER_FLAG_BGPSEC_MPE_IPV4;
+  }
+  else if (strncmp (argv[1], "re", 2) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_CAPABILITY_RECV;
+  }
+  else if (strncmp (argv[1], "b", 1) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_CAPABILITY_SEND | PEER_FLAG_BGPSEC_CAPABILITY_RECV
+           | PEER_FLAG_BGPSEC_MPE_IPV4;
+  }
+  else if (strncmp (argv[1], "m", 1) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_MIGRATE;
+  }
+  else if (strncmp (argv[1], "ro", 2) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_ROUTE_SERVER;
+  }
+  else
+  {
+    return CMD_ERR_INCOMPLETE;
+  }
+
+  return peer_flag_set_vty(vty, argv[0], flag);
+}
+
+// @TODO: Create defines for that and add them to the other ones.
+DEFUN (no_neighbor_capability_bgpsec,
+       no_neighbor_capability_bgpsec_cmd,
+       SRX_VTY_CMD_NO_NEIGHBOR_BGPSEC_MODE,
+       SRX_VTY_HLP_NO_NEIGHBOR_BGPSEC_MODE)
+{
+  u_int16_t flag = 0;
+
+  if (strncmp (argv[1], "s", 1) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_CAPABILITY_SEND | PEER_FLAG_BGPSEC_MPE_IPV4;
+  }
+  else if (strncmp (argv[1], "re", 2) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_CAPABILITY_RECV;
+  }
+  else if (strncmp (argv[1], "b", 1) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_CAPABILITY_SEND | PEER_FLAG_BGPSEC_CAPABILITY_RECV
+           | PEER_FLAG_BGPSEC_MPE_IPV4;
+  }
+  else if (strncmp (argv[1], "m", 1) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_MIGRATE;
+  }
+  else if (strncmp (argv[1], "ro", 1) == 0)
+  {
+    flag = PEER_FLAG_BGPSEC_ROUTE_SERVER;
+  }
+  else
+  {
+    return CMD_ERR_INCOMPLETE;
+  }
+
+  return peer_flag_unset_vty(vty, argv[0], flag);
+}
+
+/* bgpsec neighbor capability */
+// DO NOT USE THIS ANYMORE
+DEFUN (neighbor_bgpsec_mpnlri_ipv4,
+       neighbor_bgpsec_mpnlri_ipv4_cmd,
+       NEIGHBOR_CMD2 "mpe",
+       NEIGHBOR_STR
+       NEIGHBOR_ADDR_STR2
+       "Deprecated: Encode sending IPv4 as MPNLRI. Covered by bgpsec (both|snd)!\n")
+{
+  u_int16_t flag = 0;
+
+  flag = PEER_FLAG_BGPSEC_MPE_IPV4;
+  
+  vty_out (vty, "This command is deprecated and not used anymore. " \
+          "This flag will be set automatically if bgpsec send is enabled for this neighbor%s", 
+          VTY_NEWLINE);
+
+//  return peer_flag_set_vty(vty, argv[0], flag);
+  peer_flag_set_vty(vty, argv[0], flag);
+  return CMD_WARNING;
+}
+
+
+#endif /* USE_SRX */
 
 static int
 peer_af_flag_modify_vty (struct vty *vty, const char *peer_str, afi_t afi,
@@ -7270,6 +8337,12 @@ bgp_show_summary (struct vty *vty, struct bgp *bgp, int afi, int safi)
                                      ents * sizeof (struct bgp_node)),
                        VTY_NEWLINE);
               
+              #ifdef USE_SRX
+              vty_out (vty,
+                       "SRx host %s, port %d%s",
+                       bgp->srx_host, bgp->srx_port, VTY_NEWLINE);
+              #endif /* USE_SRX */
+			  
               /* Peer related usage */
               ents = listcount (bgp->peer);
               vty_out (vty, "Peers %ld, using %s of memory%s",
@@ -9951,6 +11024,68 @@ bgp_vty_init (void)
   install_element (BGP_NODE, &no_bgp_default_local_preference_cmd);
   install_element (BGP_NODE, &no_bgp_default_local_preference_val_cmd);
 
+#ifdef USE_SRX
+  /* "srx *" commands. */
+  install_element (BGP_NODE, &srx_show_config_cmd);
+
+  install_element (BGP_NODE, &srx_connect_short_cmd);
+  install_element (BGP_NODE, &srx_connect_cmd);
+  install_element (BGP_NODE, &srx_disconnect_cmd);
+
+  install_element (BGP_NODE, &srx_set_server_cmd);
+
+  install_element (BGP_NODE, &srx_conf_default_roa_result_valid_cmd);
+  install_element (BGP_NODE, &srx_conf_default_roa_result_unknown_cmd);
+  install_element (BGP_NODE, &srx_conf_default_roa_result_invalid_cmd);
+  install_element (BGP_NODE, &srx_conf_default_roa_result_undefined_cmd);
+  install_element (BGP_NODE, &srx_conf_default_path_result_valid_cmd);
+  install_element (BGP_NODE, &srx_conf_default_path_result_invalid_cmd);
+  install_element (BGP_NODE, &srx_conf_default_path_result_undefined_cmd);
+
+  install_element (BGP_NODE, &srx_evaluation_cmd);
+  install_element (BGP_NODE, &no_srx_evaluation_cmd);
+
+// NOT IN THIS VERSION
+//  install_element (BGP_NODE, &srx_apply_policy_cmd);
+
+  install_element (BGP_NODE, &srx_display_cmd);
+  install_element (BGP_NODE, &no_srx_display_cmd);
+
+  install_element (BGP_NODE, &srx_keepwindow_cmd);
+  install_element (BGP_NODE, &srx_proxyid_cmd);
+
+  install_element (BGP_NODE, &srx_policy_local_preference_var_cmd);
+  install_element (BGP_NODE, &srx_policy_local_preference_fix_cmd);
+  install_element (BGP_NODE, &no_srx_policy_local_preference_cmd);
+
+  install_element (BGP_NODE, &srx_policy_ignore_notfound_cmd);
+  install_element (BGP_NODE, &no_srx_policy_ignore_notfound_cmd);
+
+  install_element (BGP_NODE, &srx_policy_ignore_invalid_cmd);
+  install_element (BGP_NODE, &no_srx_policy_ignore_invalid_cmd);
+
+  install_element (BGP_NODE, &srx_policy_ignore_undefined_cmd);
+  install_element (BGP_NODE, &no_srx_policy_ignore_undefined_cmd);
+
+  install_element (BGP_NODE, &srx_policy_prefer_valid_cmd);
+  install_element (BGP_NODE, &no_srx_policy_prefer_valid_cmd);
+  // The following two entries are deprecated but kept in place to not break
+  // all previous configurations. It will be mapped into install ski 1 and also
+  // selects this ski. Also a warning will be printed.
+  install_element (BGP_NODE, &bgpsec_ski_cmd);
+  // This will only display a NOT USED anymore warning. Printout for running 
+  // config and all other functional code will be removed.
+  install_element (BGP_NODE, &bgpsec_sign_cmd);
+  // New key management  
+  install_element (BGP_NODE, &srx_bgpsec_ski_cmd);
+  install_element (BGP_NODE, &srx_bgpsec_active_ski_cmd);
+  install_element (BGP_NODE, &srx_bgpsec_register_pkeys_cmd);
+  
+  install_element (BGP_NODE, &srx_send_extcommunity_cmd);
+  install_element (BGP_NODE, &srx_send_extcommunity_ebgp_cmd);
+  install_element (BGP_NODE, &no_srx_send_extcommunity_cmd);
+#endif /* USE_SRX */
+
   /* "neighbor remote-as" commands. */
   install_element (BGP_NODE, &neighbor_remote_as_cmd);
   install_element (BGP_NODE, &no_neighbor_cmd);
@@ -10391,6 +11526,12 @@ bgp_vty_init (void)
   install_element (BGP_IPV6_NODE, &no_neighbor_capability_orf_prefix_cmd);
   install_element (BGP_IPV6M_NODE, &neighbor_capability_orf_prefix_cmd);
   install_element (BGP_IPV6M_NODE, &no_neighbor_capability_orf_prefix_cmd);
+#ifdef USE_SRX
+  install_element (BGP_NODE, &neighbor_capability_bgpsec_cmd);
+  install_element (BGP_NODE, &no_neighbor_capability_bgpsec_cmd);
+  // this one is deprecated
+  install_element (BGP_NODE, &neighbor_bgpsec_mpnlri_ipv4_cmd);
+#endif
 
   /* "neighbor capability dynamic" commands.*/
   install_element (BGP_NODE, &neighbor_capability_dynamic_cmd);
@@ -10574,7 +11715,7 @@ bgp_vty_init (void)
   install_element (BGP_IPV6M_NODE, &neighbor_unsuppress_map_cmd);
   install_element (BGP_IPV6M_NODE, &no_neighbor_unsuppress_map_cmd);
   install_element (BGP_VPNV4_NODE, &neighbor_unsuppress_map_cmd);
-  install_element (BGP_VPNV4_NODE, &no_neighbor_unsuppress_map_cmd);
+  install_element (BGP_VPNV4_NODE, &no_neighbor_unsuppress_map_cmd);  
   install_element (BGP_VPNV6_NODE, &neighbor_unsuppress_map_cmd);
   install_element (BGP_VPNV6_NODE, &no_neighbor_unsuppress_map_cmd);
   install_element (BGP_ENCAP_NODE, &neighbor_unsuppress_map_cmd);
@@ -11172,6 +12313,8 @@ bgp_vty_init (void)
   install_element (VIEW_NODE, &show_ip_bgp_ipv4_paths_cmd);
   install_element (ENABLE_NODE, &show_ip_bgp_paths_cmd);
   install_element (ENABLE_NODE, &show_ip_bgp_ipv4_paths_cmd);
+
+
   /* Community-list. */
   community_list_vty ();
 }

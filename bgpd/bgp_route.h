@@ -22,6 +22,10 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 #define _QUAGGA_BGP_ROUTE_H
 
 #include "bgp_table.h"
+#ifdef USE_SRX
+#include "bgp_info_hash.h"
+#include <srx/srx_api.h>
+#endif /* USE_SRX */
 
 /* Ancillary information to struct bgp_info, 
  * used for uncommonly used data (aggregation, MPLS, etc.)
@@ -82,6 +86,9 @@ struct bgp_info
 #define BGP_INFO_COUNTED	(1 << 10)
 #define BGP_INFO_MULTIPATH      (1 << 11)
 #define BGP_INFO_MULTIPATH_CHG  (1 << 12)
+#ifdef USE_SRX
+#define BGP_INFO_IGNORE         (1 << 13)
+#endif /* USE_SRX */
 
   /* BGP route type.  This can be static, RIP, OSPF, BGP etc.  */
   u_char type;
@@ -93,6 +100,16 @@ struct bgp_info
 #define BGP_ROUTE_STATIC       1
 #define BGP_ROUTE_AGGREGATE    2
 #define BGP_ROUTE_REDISTRIBUTE 3 
+
+#ifdef USE_SRX
+  struct bgp_node        *node;
+  //The info hash that holds the update.
+  struct bgp_info_hash   *info_hash;
+  SRxUpdateID            updateID;
+  uint32_t               localID;
+  SRxValidationResultVal val_res_ROA;
+  SRxValidationResultVal val_res_BGPSEC;
+#endif /* USE_SRX */
 };
 
 /* BGP static route configuration. */
@@ -127,9 +144,41 @@ struct bgp_static
   u_char tag[3];
 };
 
+#ifdef USE_SRX
+
+struct SRxThread
+{
+    int sock;
+    struct thread *t_read;
+    void* clconnectionHandler;
+    int clientFD;
+    int prevClientFD;
+    void* proxy;
+};
+
+// Global variable used to manage the SRx proxy socket - initialized in
+// bgp_route.c::initUnSocket and also modified in bgpd.c::srx_connect(...)
+struct SRxThread *g_rq;
+// helper to allow connection command to be set during configuration. This
+// variable is either NULL or the bgp instance. It only will be set to the
+// bgp instance when in configuration mode, not when configuration will be
+// altered from console. The only methods that alter this variable are
+// bgpd.c::bgp_srx_set and bgp_route.c::initUnSocket. The later on is the only
+// function reading this value.sfinitUnSocket
+void* flagDoConnectSrx;
+
+/* Flags which indicate a route is unusable in some form */
+#define BGP_INFO_UNUSEABLE \
+  (BGP_INFO_HISTORY|BGP_INFO_DAMPED|BGP_INFO_REMOVED|BGP_INFO_IGNORE)
+
+#else /* USE_SRX */
+
 /* Flags which indicate a route is unuseable in some form */
 #define BGP_INFO_UNUSEABLE \
   (BGP_INFO_HISTORY|BGP_INFO_DAMPED|BGP_INFO_REMOVED)
+
+#endif /* USE_SRX */
+
 /* Macro to check BGP information is alive or not.  Sadly,
  * not equivalent to just checking previous, because of the
  * sense of the additional VALID flag.
@@ -195,6 +244,26 @@ extern void bgp_info_delete (struct bgp_node *rn, struct bgp_info *ri);
 extern struct bgp_info_extra *bgp_info_extra_get (struct bgp_info *);
 extern void bgp_info_set_flag (struct bgp_node *, struct bgp_info *, u_int32_t);
 extern void bgp_info_unset_flag (struct bgp_node *, struct bgp_info *, u_int32_t);
+#ifdef USE_SRX
+extern int  bgp_info_set_ignore_flag(struct bgp_info *);
+extern void srx_bgp_requeue_update(struct bgp_info *);
+extern void srx_bgp_requeue_all(struct bgp *);
+extern void bgp_info_set_validation_result (struct bgp_info *,
+                                       ValidationResultType resType,
+                                       uint8_t roaResult, uint8_t bgpsecResult);
+extern void verify_update (struct bgp *bgp, struct bgp_info *info,
+                           SRxDefaultResult* defResult, bool doRegisterLocalID);
+extern int  srx_calc_validation_state(struct bgp *, struct bgp_info *);
+struct SRxThread* srx_thread_arg_new(void);
+int checkClientConnection(struct thread *t);
+int initUnSocket(struct thread *t);
+int checkSendQueue(struct thread *t);
+void threadControlCall(int type);
+extern void srx_set_default(struct bgp *bgp);
+int checkEcomSRxValid(struct attr* attr);
+uint32_t getNextLocalID(void);
+
+#endif /* USE_SRX */
 
 extern int bgp_nlri_parse_ip (struct peer *, struct attr *, struct bgp_nlri *);
 

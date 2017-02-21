@@ -147,7 +147,7 @@ bgp_afi_safi_valid_indices (afi_t afi, safi_t *safi)
     }
 
   zlog_debug ("unknown afi/safi (%u/%u)", afi, *safi);
-
+  
   return 0;
 }
 
@@ -478,7 +478,11 @@ bgp_capability_parse (struct peer *peer, size_t length, int *mp_capability,
   int ret;
   struct stream *s = BGP_INPUT (peer);
   size_t end = stream_get_getp (s) + length;
-  
+
+#ifdef USE_SRX
+  struct BgpsecCapVal cv;
+#endif
+
   assert (STREAM_READABLE (s) >= length);
   
   while (stream_get_getp (s) < end)
@@ -524,6 +528,9 @@ bgp_capability_parse (struct peer *peer, size_t length, int *mp_capability,
           case CAPABILITY_CODE_RESTART:
           case CAPABILITY_CODE_AS4:
           case CAPABILITY_CODE_DYNAMIC:
+#ifdef USE_SRX
+          case CAPABILITY_CODE_BGPSEC:
+#endif
               /* Check length. */
               if (caphdr.length < cap_minsizes[caphdr.code])
                 {
@@ -607,6 +614,39 @@ bgp_capability_parse (struct peer *peer, size_t length, int *mp_capability,
               if (!bgp_capability_as4 (peer, &caphdr))
                 return -1;
               break;            
+#ifdef USE_SRX
+          case CAPABILITY_CODE_BGPSEC:
+              memset(&cv, 0xff, sizeof(struct BgpsecCapVal));
+              cv.version_dir = stream_getc(s);
+              cv.afi = stream_getw(s);
+
+              if (BGP_DEBUG (bgpsec, BGPSEC_IN) || BGP_DEBUG(bgpsec, BGPSEC_DETAIL))
+              {
+                zlog_debug("[BGPSEC] ------- BGPSEC capability parsing -------");
+                zlog_debug("[BGPSEC] %s capability code: %d length:%d version_dir:%02x afi:%02x", \
+                    peer->host, caphdr.code, caphdr.length, cv.version_dir, cv.afi);
+              }
+
+              /* check if the connected peer has the recv-direction capability */
+              if( (cv.version_dir & ~(BGPSEC_CAP_DIR_RECV)) == 0)    // 0x00 : dir bit
+              {
+                SET_FLAG (peer->cap, PEER_CAP_BGPSEC_ADV);
+
+                if (BGP_DEBUG (bgpsec, BGPSEC_IN) || BGP_DEBUG(bgpsec, BGPSEC_DETAIL))
+                  zlog_debug("[BGPSEC] peer Capability RECV set");
+              }
+
+              /* check if the connected peer has the send-direction capability */
+              //if( (cv.version_dir & 0x08) == 0)    // 0x08 : dir bit
+              if( cv.version_dir & (BGPSEC_CAP_DIR_SEND))    // 0x08 : dir bit
+              {
+                SET_FLAG (peer->cap, PEER_CAP_BGPSEC_ADV_SEND);
+
+                if (BGP_DEBUG (bgpsec, BGPSEC_IN) || BGP_DEBUG(bgpsec, BGPSEC_DETAIL))
+                  zlog_debug("[BGPSEC] peer Capability SEND set");
+              }
+              break;
+#endif
           default:
             if (caphdr.code > 128)
               {
@@ -803,6 +843,13 @@ bgp_open_option_parse (struct peer *peer, u_char length, int *mp_capability)
 	  ret = -1;
 	  break;
 	}
+#if 0
+      /* Notification is sending to neighbor : type 2/99 */
+      if(ret < 0 && ret == -2)
+        bgp_notify_send (peer,
+                         BGP_NOTIFY_OPEN_ERR,
+                         BGP_NOTIFY_OPEN_UNSUP_BGPSEC);
+#endif
 
       /* Parse error.  To accumulate all unsupported capability codes,
          bgp_capability_parse does not return -1 when encounter
@@ -1097,7 +1144,40 @@ bgp_open_capability (struct stream *s, struct peer *peer)
       stream_putc (s, CAPABILITY_CODE_DYNAMIC);
       stream_putc (s, CAPABILITY_CODE_DYNAMIC_LEN);
     }
+#ifdef USE_SRX
+//FIXME: I'm concerned that this is in the right location within this function
+  /* BGPSEC Capability */
+  if (CHECK_FLAG (peer->flags, PEER_FLAG_BGPSEC_CAPABILITY_SEND))
+  {
+    /* direction - send, IPv4 capability */
+    stream_putc (s, BGP_OPEN_OPT_CAP);
+    stream_putc (s, CAPABILITY_CODE_BGPSEC_LEN + 2);
+    stream_putc (s, CAPABILITY_CODE_BGPSEC);
+    stream_putc (s, CAPABILITY_CODE_BGPSEC_LEN);
+    makeBgpsecCapability(s, BGPSEC_CAP_VERSION, BGPSEC_CAP_DIR_SEND, BGPSEC_CAP_AFI_IPv4);
 
+    if (BGP_DEBUG (bgpsec, BGPSEC_OUT) || BGP_DEBUG(bgpsec, BGPSEC_DETAIL))
+      zlog_debug("[BGPSEC]  %s: BGPSEC SEND Capability set", __FUNCTION__);
+  }
+
+  if(CHECK_FLAG (peer->flags, PEER_FLAG_BGPSEC_CAPABILITY_RECV))
+  {
+    /* direction -  recv, IPv4 capability */
+    stream_putc (s, BGP_OPEN_OPT_CAP);
+    stream_putc (s, CAPABILITY_CODE_BGPSEC_LEN + 2);
+    stream_putc (s, CAPABILITY_CODE_BGPSEC);
+    stream_putc (s, CAPABILITY_CODE_BGPSEC_LEN);
+    makeBgpsecCapability(s, BGPSEC_CAP_VERSION, BGPSEC_CAP_DIR_RECV, BGPSEC_CAP_AFI_IPv4);
+
+    if (BGP_DEBUG (bgpsec, BGPSEC_OUT) || BGP_DEBUG(bgpsec, BGPSEC_DETAIL))
+      zlog_debug("[BGPSEC]  %s: BGPSEC RECV Capability set", __FUNCTION__);
+  }
+  else if(!CHECK_FLAG (peer->flags, PEER_FLAG_BGPSEC_CAPABILITY_SEND))
+  {
+    if (BGP_DEBUG (bgpsec, BGPSEC_OUT) || BGP_DEBUG(bgpsec, BGPSEC_DETAIL))
+      zlog_debug("[BGPSEC]  %s: BGPSEC Capability NOT set", __FUNCTION__);
+  }
+#endif
   /* Sending base graceful-restart capability irrespective of the config */
   SET_FLAG (peer->cap, PEER_CAP_RESTART_ADV);
   stream_putc (s, BGP_OPEN_OPT_CAP);
@@ -1131,7 +1211,6 @@ bgp_open_capability (struct stream *s, struct peer *peer)
   /* Total Graceful restart capability Len. */
   len = stream_get_endp (s) - rcapp - 1;
   stream_putc_at (s, rcapp, len);
-
   /* Total Capability Len. */
   len = stream_get_endp (s) - capp - 1;
   stream_putc_at (s, capp, len);
@@ -1140,3 +1219,16 @@ bgp_open_capability (struct stream *s, struct peer *peer)
   len = stream_get_endp (s) - cp - 1;
   stream_putc_at (s, cp, len);
 }
+#ifdef USE_SRX
+void makeBgpsecCapability(struct stream* s, uint8_t version, uint8_t dir, uint16_t afi)
+{
+  struct BgpsecCapVal cv;
+  memset(&cv, 0x0, sizeof(struct BgpsecCapVal));
+  SET_FLAG(cv.version_dir, version);
+  SET_FLAG(cv.version_dir, dir);
+  cv.afi = afi;
+
+  stream_putc (s, cv.version_dir);
+  stream_putw (s, cv.afi);
+}
+#endif

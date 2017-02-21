@@ -39,6 +39,11 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 
 /* Packet send and receive function prototypes. */
 extern int bgp_read (struct thread *);
+#ifdef USE_SRX
+extern int bgp_read2 (struct thread *);
+struct ecommunity* srxEcommunityChange(struct bgp *, struct attr *, struct bgp_info *);
+int srxEcommunityRestore(struct attr *, struct ecommunity* );
+#endif /* USE_SRX */
 extern int bgp_write (struct thread *);
 
 extern void bgp_keepalive_send (struct peer *);

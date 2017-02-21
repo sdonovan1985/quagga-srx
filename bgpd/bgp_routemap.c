@@ -632,6 +632,9 @@ route_match_metric (void *rule, struct prefix *prefix,
   return RMAP_NOMATCH;
 }
 
+
+
+
 /* Route map commands for metric matching. */
 struct route_map_rule_cmd route_match_metric_cmd =
 {
@@ -1067,6 +1070,11 @@ route_set_local_pref (void *rule, struct prefix *prefix,
   return RMAP_OKAY;
 }
 
+
+
+
+
+
 /* Set local preference rule structure. */
 struct route_map_rule_cmd route_set_local_pref_cmd = 
 {
@@ -1103,6 +1111,10 @@ route_set_weight (void *rule, struct prefix *prefix, route_map_object_t type,
 
   return RMAP_OKAY;
 }
+
+
+
+
 
 /* Set local preference rule structure. */
 struct route_map_rule_cmd route_set_weight_cmd = 
@@ -1534,6 +1546,9 @@ struct route_map_rule_cmd route_set_ecommunity_rt_cmd =
 
 /* `set extcommunity soo COMMUNITY' */
 
+
+
+
 /* Compile function for set community. */
 static void *
 route_set_ecommunity_soo_compile (const char *arg)
@@ -1556,6 +1571,88 @@ struct route_map_rule_cmd route_set_ecommunity_soo_cmd =
   route_set_ecommunity_free,
 };
 
+#ifdef USE_SRX
+/* `set extcommunity opaque COMMUNITY for BGPSEC ' */
+
+/* For community set mechanism. */
+static route_map_result_t
+route_set_ecommunity_bgpsec (void *rule, struct prefix *prefix,
+                            route_map_object_t type, void *object)
+{
+  struct ecommunity *ecom;
+  struct ecommunity *new_ecom;
+  struct ecommunity *old_ecom;
+  struct bgp_info *bgp_info;
+
+  if (type == RMAP_BGP)
+  {
+    ecom = rule;
+    bgp_info = object;
+
+    if (! ecom)
+      return RMAP_OKAY;
+
+    /* We assume additive for Extended Community. */
+    old_ecom = (bgp_attr_extra_get (bgp_info->attr))->ecommunity;
+
+    if (old_ecom)
+      new_ecom = ecommunity_merge (ecommunity_dup (old_ecom), ecom);
+    else
+      new_ecom = ecommunity_dup (ecom);
+
+    /* TODO: modify ecomm value according to bgp_info */
+    zlog_debug(" bgp_info->val_res_ROA:%d ", bgp_info->val_res_ROA);
+    zlog_debug(" ecom_value: %08x ", *new_ecom->val);
+
+    bgp_info->attr->extra->ecommunity = ecommunity_intern (new_ecom);
+
+    if (old_ecom)
+      ecommunity_unintern (&old_ecom);
+
+    bgp_info->attr->flag |= ATTR_FLAG_BIT (BGP_ATTR_EXT_COMMUNITIES);
+    zlog_debug(" interned ecom_addr:%p ", bgp_info->attr->extra->ecommunity);
+    zlog_debug(" flag:%08x ", bgp_info->attr->flag);
+
+  }
+
+  return RMAP_OKAY;
+}
+
+/* Compile function for set community. */
+static void *
+route_set_ecommunity_bgpsec_compile (const char *arg)
+{
+  struct ecommunity *ecom;
+  unsigned int uiValid;
+
+  uiValid = atoi(arg);
+
+  if (uiValid < 0 || uiValid > ECOMMUNITY_BGPSEC_INVALID)
+    return NULL;
+
+  ecom = ecommunity_bgpsec_str2com (ECOMMUNITY_BGPSEC_SUB, uiValid);
+  if (! ecom)
+    return NULL;
+  return ecommunity_intern (ecom);
+}
+
+/* Free function for set community. */
+static void
+route_set_ecommunity_bgpsec_free (void *rule)
+{
+  struct ecommunity *ecom = rule;
+  ecommunity_unintern (&ecom);
+}
+
+/* Set community rule structure. */
+struct route_map_rule_cmd route_set_ecommunity_bgpsec_cmd =
+{
+  "extcommunity bgpsec",
+  route_set_ecommunity_bgpsec,
+  route_set_ecommunity_bgpsec_compile,
+  route_set_ecommunity_bgpsec_free,
+};
+#endif
 /* `set origin ORIGIN' */
 
 /* For origin set. */
@@ -3425,6 +3522,37 @@ ALIAS (no_set_ecommunity_soo,
        "Site-of-Origin extended community\n"
        "VPN extended community\n")
 
+#ifdef USE_SRX
+DEFUN (set_ecommunity_bgpsec,
+       set_ecommunity_bgpsec_cmd,
+       "set extcommunity bgpsec ValidationState",
+       SET_STR
+       "BGP extended community attribute\n"
+       "BGPSEC extended community\n"
+       "validation status value\n")
+{
+  int ret;
+  char *str;
+
+  str = argv_concat (argv, argc, 0);
+  ret = bgp_route_set_add (vty, vty->index, "extcommunity bgpsec", str);
+  XFREE (MTYPE_TMP, str);
+
+  return ret;
+}
+
+DEFUN (no_set_ecommunity_bgpsec,
+       no_set_ecommunity_bgpsec_cmd,
+       "no set extcommunity bgpsec",
+       NO_STR
+       SET_STR
+       "BGP extended community attribute\n"
+       "BGPSEC extended community\n")
+{
+  return bgp_route_set_delete (vty, vty->index, "extcommunity bgpsec", NULL);
+}
+#endif
+
 DEFUN (set_origin,
        set_origin_cmd,
        "set origin (egp|igp|incomplete)",
@@ -3895,6 +4023,9 @@ bgp_route_map_init (void)
   route_map_install_set (&route_set_originator_id_cmd);
   route_map_install_set (&route_set_ecommunity_rt_cmd);
   route_map_install_set (&route_set_ecommunity_soo_cmd);
+#ifdef USE_SRX
+  route_map_install_set (&route_set_ecommunity_bgpsec_cmd);
+#endif
 
   install_element (RMAP_NODE, &match_peer_cmd);
   install_element (RMAP_NODE, &match_peer_local_cmd);
@@ -3984,6 +4115,10 @@ bgp_route_map_init (void)
   install_element (RMAP_NODE, &no_set_ecommunity_rt_val_cmd);
   install_element (RMAP_NODE, &set_ecommunity_soo_cmd);
   install_element (RMAP_NODE, &no_set_ecommunity_soo_cmd);
+#ifdef USE_SRX
+  install_element (RMAP_NODE, &set_ecommunity_bgpsec_cmd);
+  install_element (RMAP_NODE, &no_set_ecommunity_bgpsec_cmd);
+#endif
   install_element (RMAP_NODE, &no_set_ecommunity_soo_val_cmd);
   install_element (RMAP_NODE, &set_vpnv4_nexthop_cmd);
   install_element (RMAP_NODE, &no_set_vpnv4_nexthop_cmd);
@@ -3998,7 +4133,7 @@ bgp_route_map_init (void)
   route_map_install_set (&route_set_ipv6_nexthop_global_cmd);
   route_map_install_set (&route_set_ipv6_nexthop_local_cmd);
   route_map_install_set (&route_set_ipv6_nexthop_peer_cmd);
-
+  
   install_element (RMAP_NODE, &match_ipv6_address_cmd);
   install_element (RMAP_NODE, &no_match_ipv6_address_cmd);
   install_element (RMAP_NODE, &match_ipv6_next_hop_cmd);

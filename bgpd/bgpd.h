@@ -24,6 +24,309 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 /* For union sockunion.  */
 #include "sockunion.h"
 
+#ifdef USE_SRX
+#include <srx/srx_api.h>
+#include <srx/srxcryptoapi.h>
+#include "bgp_info_hash.h"
+
+// @TODO: REMOVE THIS MACRO
+#define SRX_PRINT_HEX(DATA, DLEN)    \
+{                                    \
+  int sph_idx = 0;                   \
+  while (sph_idx < DLEN)             \
+  {                                  \
+    if (sph_idx % 16 == 0)           \
+    {                                \
+      printf ("\n");                 \
+    }                                \
+    else if (sph_idx % 8 == 0)       \
+    {                                \
+      printf (" ");                  \
+    }                                \
+    printf(" %02X", DATA[sph_idx]);  \
+    sph_idx++;                       \
+  }                                  \
+  printf ("\n");                     \
+}
+
+/** For now two 
+ * different private keys seem to be enough.*/
+#define SRX_MAX_PRIVKEYS 2
+
+#define SRX_VTY_HLP_STR         "SRx configuration setting\n"
+
+#define SRX_VTY_EVAL_ORIGIN_ONLY "origin_only"
+#define SRX_VTY_EVAL_BGPSEC      "bgpsec"
+
+#define SRX_VTY_PARAM_CONNECT_SRV  0
+#define SRX_VTY_PARAM_CONNECT_PORT 1
+#define SRX_VTY_CMD_CONNECT_SHORT "srx connect"
+#define SRX_VTY_HLP_CONNECT_SHORT SRX_VTY_HLP_STR \
+                                  "Connect the router with SRx server\n"
+#define SRX_VTY_CMD_CONNECT   SRX_VTY_CMD_CONNECT_SHORT " .LINE <0-65535>"
+#define SRX_VTY_OUT_CONNECT   "srx connect %s %d%s"
+#define SRX_VTY_HLP_CONNECT   SRX_VTY_HLP_CONNECT_SHORT \
+                              "Specifies SRx server host name or IP address\n" \
+                              "Specifies SRx server port\n"
+
+#define SRX_VTY_CMD_DISCONNECT  "srx disconnect"
+#define SRX_VTY_HLP_DISCONNECT  SRX_VTY_HLP_STR \
+                                "Disconnect from the SRx server\n"
+
+#define SRX_VTY_CMD_DISPLAY     "srx display"
+#define SRX_VTY_OUT_DISPLAY     "srx diaplay%s"
+#define SRX_VTY_HLP_DISPLAY     SRX_VTY_HLP_STR \
+                                "Add SRx related output to the \"show\"" \
+                                " commands\n"
+#define SRX_VTY_HLP_DISPLAY_NO  SRX_VTY_HLP_STR \
+                                "Hide SRx related output from the \"show\"" \
+                                " commands\n"
+
+#define SRX_VTY_CMD_EVALUATE    "srx evaluation (" SRX_VTY_EVAL_ORIGIN_ONLY \
+                                                 "|" SRX_VTY_EVAL_BGPSEC ")"
+#define SRX_VTY_OUT_EVALUATE    "srx evaluation %s%s"
+#define SRX_VTY_HLP_EVALUATE    SRX_VTY_HLP_STR \
+                                "Activate the policy processing\n" \
+                                "Only perform prefix origin validation using " \
+                                  "ROAs\n" \
+                                "Perform both, prefix origin validation using" \
+                                  " ROA's and path validation\n"
+#define SRX_VTY_CMD_NO_EVALUATE "no srx evaluation"
+#define SRX_VTY_HLP_NO_EVALUATE  NO_STR SRX_VTY_HLP_STR \
+                                "Deactivate the policy processing.\n" \
+
+#define SRX_VTY_CMD_KEEPWINDOW_SHORT "srx keep-window"
+#define SRX_VTY_CMD_KEEPWINDOW  SRX_VTY_CMD_KEEPWINDOW_SHORT " <0-65535>"
+#define SRX_VTY_HLP_KEEPWINDOW  SRX_VTY_HLP_STR \
+                                "Configure amount of time in seconds the SRx is" \
+                                " requested to hold information after it "\
+                                " is deleted!\n" \
+                                "Time in seconds \'0\' disables this feature!\n"
+
+//The short version is not a stand alone command, it is needed for a vtty output
+#define SRX_VTY_CMD_SET_SERVER_SHORT "srx set-server"
+#define SRX_VTY_CMD_SET_SERVER  SRX_VTY_CMD_SET_SERVER_SHORT " .LINE <0-65535>"
+#define SRX_VTY_HLP_SET_SERVER  SRX_VTY_HLP_STR \
+                                "Set the SRx server connection parameters\n"
+
+#define SRX_VTY_CMD_PROXYID "srx set-proxy-id A.B.C.D"
+#define SRX_VTY_HLP_PROXYID SRX_VTY_HLP_STR \
+                            "Configure the proxy id. This is the id used to " \
+                            "connect to the srx-server. By default the proxy " \
+                            "is the same as the BGP router id. The id is " \
+                            "specified a 4 byte unsigned integer specified " \
+                            "in IPv4 format.\n"
+
+#define SRX_VTY_CMD_SHOW_CONFIG "show srx-config"
+#define SRX_VTY_HLP_SHOW_CONFIG SHOW_STR "SRx-BGP Router configuration\n"
+
+// DEFAULT VALIDATION RESULT PARAMETER
+#define SRX_VTY_PARAM_ORIGIN_VALUE 0
+#define SRX_VTY_PARAM_PATH_VALUE   1
+
+#define SRX_VTY_PARAM_BGPSEC_MIN_ALGOID 1
+#define SRX_VTY_PARAM_BGPSEC_MAX_ALGOID 254
+
+// DEFAULT VALIDATION RESULT FOR ORIGIN VALIDATION
+#define SRX_VTY_CMD_CONF_DEF_ROA_RES_STR "srx set-origin-value "
+#define SRX_VTY_CMD_CONF_DEF_ROA_RES_VALID \
+                                 SRX_VTY_CMD_CONF_DEF_ROA_RES_STR "valid\n"
+#define SRX_VTY_CMD_CONF_DEF_ROA_RES_NOTFOUND \
+                                 SRX_VTY_CMD_CONF_DEF_ROA_RES_STR "notfound\n"
+#define SRX_VTY_CMD_CONF_DEF_ROA_RES_INVALID \
+                                 SRX_VTY_CMD_CONF_DEF_ROA_RES_STR "invalid\n"
+#define SRX_VTY_CMD_CONF_DEF_ROA_RES_UNDEFINED \
+                                 SRX_VTY_CMD_CONF_DEF_ROA_RES_STR "undefined\n"
+
+#define SRX_VTY_HLP_CONF_DEF_ROA_RES_STR SRX_VTY_HLP_STR \
+                                 "Configure the default result value for " \
+                                   "origin validation\n" \
+                                 "The route originations default validation " \
+                                   "value is "
+#define SRX_VTY_HLP_CONF_DEF_ROA_RES_VALID \
+                                 SRX_VTY_HLP_CONF_DEF_ROA_RES_STR  "valid\n"
+#define SRX_VTY_HLP_CONF_DEF_ROA_RES_NOTFOUND \
+                                 SRX_VTY_HLP_CONF_DEF_ROA_RES_STR  "notfound\n"
+#define SRX_VTY_HLP_CONF_DEF_ROA_RES_INVALID \
+                                 SRX_VTY_HLP_CONF_DEF_ROA_RES_STR  "invalid\n"
+#define SRX_VTY_HLP_CONF_DEF_ROA_RES_UNDEFINED \
+                                 SRX_VTY_HLP_CONF_DEF_ROA_RES_STR  "undefined\n"
+
+// DEFAULT VALIDATION RESULT FOR PATH VALIDATION
+#define SRX_VTY_CMD_CONF_DEF_PATH_RES_STR "srx set-path-value "
+#define SRX_VTY_CMD_CONF_DEF_PATH_RES_VALID \
+                                 SRX_VTY_CMD_CONF_DEF_PATH_RES_STR "valid\n"
+#define SRX_VTY_CMD_CONF_DEF_PATH_RES_INVALID \
+                                 SRX_VTY_CMD_CONF_DEF_PATH_RES_STR "invalid\n"
+#define SRX_VTY_CMD_CONF_DEF_PATH_RES_UNDEFINED \
+                                 SRX_VTY_CMD_CONF_DEF_PATH_RES_STR "undefined\n"
+
+#define SRX_VTY_HLP_CONF_DEF_PATH_RES_STR SRX_VTY_HLP_STR \
+                                 "Configure the default result value for " \
+                                   "path validation\n" \
+                                 "The route originations default validation " \
+                                   "value is "
+#define SRX_VTY_HLP_CONF_DEF_PATH_RES_VALID \
+                                 SRX_VTY_HLP_CONF_DEF_PATH_RES_STR "valid\n"
+#define SRX_VTY_HLP_CONF_DEF_PATH_RES_INVALID \
+                                 SRX_VTY_HLP_CONF_DEF_PATH_RES_STR "invalid\n"
+#define SRX_VTY_HLP_CONF_DEF_PATH_RES_UNDEFINED \
+                                 SRX_VTY_HLP_CONF_DEF_PATH_RES_STR "undefined\n"
+
+// APPLY POLICY CHANGE
+#define SRX_VTY_CMD_APPLY_POLICY "srx apply-policy"
+#define SRX_VTY_HLP_APPLY_POLICY SRX_VTY_HLP_STR \
+                                 "Apply SRx policy changes to all updates in" \
+                                 " the RIB.\n"
+
+// POLICY
+#define SRX_VTY_HLP_POLICY      "Evaluation policy command\n"
+#define SRX_VTY_HLP_POLICY_ROA  "Prefix-origin validation using ROA's\n"
+#define SRX_VTY_HLP_POLICY_PATH "Path validation (NOT IMPLEMENTED YET)\n"
+#define SRX_VTY_HLP_ORIGIN_ONLY "(" SRX_VTY_EVAL_ORIGIN_ONLY ") "
+
+// POLICY IGNORE NOTFOUND / INVALID
+#define SRX_VTY_CMD_POL_IGNORE_NOTFOUND  "srx policy ignore-notfound"
+#define SRX_VTY_HLP_POL_IGNORE_NOTFOUND  SRX_VTY_HLP_STR SRX_VTY_HLP_POLICY \
+                                         SRX_VTY_HLP_ORIGIN_ONLY \
+                                         "Ignore updates with validation " \
+                                         "result = UNKNOWN.\n"
+
+#define SRX_VTY_CMD_POL_IGNORE_INVALID   "srx policy ignore-invalid"
+#define SRX_VTY_HLP_POL_IGNORE_INVALID   SRX_VTY_HLP_STR SRX_VTY_HLP_POLICY \
+                                         "Ignore updates with validation" \
+                                         " result = INVALID.\n"
+
+#define SRX_VTY_CMD_POL_IGNORE_UNDEFINED "srx policy ignore-undefined"
+#define SRX_VTY_HLP_POL_IGNORE_UNDEFINED SRX_VTY_HLP_STR SRX_VTY_HLP_POLICY \
+                                         "Ignore updates with no complete" \
+                                         " validation result available.\n"
+
+// POLICY LOCAL-PREF ADJUSTMENT
+#define SRX_VTY_HLP_POL_LOCP   "Manipulate local preference\n"
+#define SRX_VTY_HLP_POL_LOCP_V "Policy for validation result  = VALID\n"
+#define SRX_VTY_HLP_POL_LOCP_U SRX_VTY_HLP_ORIGIN_ONLY "Policy for " \
+                               "validation result = UNKNOWN\n"
+#define SRX_VTY_HLP_POL_LOCP_I "Policy for validation result = INVALID\n"
+
+#define SRX_VTY_HLP_POL_LOCP_A "To be added to the given local pref\n"
+#define SRX_VTY_HLP_POL_LOCP_S "To be subtracted from the given local pref\n"
+
+#define SRX_VTY_CMD_POL_LOCP      "srx policy local-preference"
+#define SRX_VTY_CMD_POL_LOCP_FIX  SRX_VTY_CMD_POL_LOCP \
+                                  " (valid|notfound|invalid) <0-4294967295>"
+#define SRX_VTY_HLP_POL_LOCP_FIX  SRX_VTY_HLP_STR SRX_VTY_HLP_POLICY \
+                                  SRX_VTY_HLP_POL_LOCP \
+                                  SRX_VTY_HLP_POL_LOCP_V \
+                                  SRX_VTY_HLP_POL_LOCP_U \
+                                  SRX_VTY_HLP_POL_LOCP_I \
+                                  "The local preference value.\n"
+
+#define SRX_VTY_CMD_POL_LOCP_VAR  SRX_VTY_CMD_POL_LOCP_FIX \
+                                  " (add|subtract)"
+#define SRX_VTY_HLP_POL_LOCP_VAR  SRX_VTY_HLP_POL_LOCP_FIX \
+                                  SRX_VTY_HLP_POL_LOCP_A \
+                                  SRX_VTY_HLP_POL_LOCP_S
+
+#define SRX_VTY_CMD_NO_POL_LOCP   "no " SRX_VTY_CMD_POL_LOCP \
+                                  " (valid|notfound|invalid)"
+#define SRX_VTY_HLP_NO_POL_LOCP   NO_STR SRX_VTY_HLP_STR SRX_VTY_HLP_POLICY \
+                                  SRX_VTY_HLP_POL_LOCP \
+                                  SRX_VTY_HLP_POL_LOCP_V \
+                                  SRX_VTY_HLP_POL_LOCP_U \
+                                  SRX_VTY_HLP_POL_LOCP_I \
+
+// POLICY PREFER-VALID
+#define SRX_VTY_CMD_POL_PREFV "srx policy prefer-valid"
+#define SRX_VTY_OUT_POL_PREFV SRX_VTY_CMD_POL_PREFV "%s"
+#define SRX_VTY_HLP_POL_PREFV SRX_VTY_HLP_STR SRX_VTY_HLP_POLICY \
+                              "Use the validation state as tie breaker" \
+                              " with valid > any other\n"
+
+// USE OF COMMUNITY STRING
+#define SRX_VTY_CMD_EXT_CSTR "srx extcommunity <0-255>"
+#define SRX_VTY_HLP_EXT_CSTR SRX_VTY_HLP_STR "Configure community string for" \
+                              " validation result transmission\n" \
+                             "The sub code of the extended community.\n"
+
+#define SRX_VTY_CMD_EXT_CSTR_EBGP SRX_VTY_CMD_EXT_CSTR " (include_ebgp|only_ibgp)"
+#define SRX_VTY_HLP_EXT_CSTR_EBGP SRX_VTY_HLP_EXT_CSTR \
+                                  "Include eBGP peers (optional)\n" \
+                                  "Only iBGP peers - also used to turn off eBGP peers\n"
+
+#define SRX_VTY_CMD_NO_EXT_CSTR "no srx extcommunity"
+#define SRX_VTY_HLP_NO_EXT_CSTR  NO_STR SRX_VTY_HLP_STR \
+                                "Deactivate the extended community validation" \
+                                 " result transfer.\n"
+
+// BGPSEC KEY MANAGEMENT
+#define SRX_VTY_HLP_BGPSEC "BGPSEC specific configuration\n"
+
+#define SRX_VTY_CMD_BGPSEC_SKI_PRNT "srx bgpsec ski (0|1) <1-254>"
+#define SRX_VTY_CMD_BGPSEC_SKI SRX_VTY_CMD_BGPSEC_SKI_PRNT " WORD"
+#define SRX_VTY_OUT_BGPSEC_SKI "srx bgpsec ski %u %s%s"
+#define SRX_VTY_HLP_BGPSEC_SKI SRX_VTY_HLP_STR SRX_VTY_HLP_BGPSEC \
+                              "Configures the SKI for the private key!\n" \
+                              "Set the algorithm ID of the key \n" \
+                              "The SKI, a 20 byte value as 40 byte HEX string of the SKI"
+
+#define SRX_VTY_CMD_BGPSEC_ACTIVE_SKI "srx bgpsec active (0|1)"
+#define SRX_VTY_OUT_BGPSEC_ACTIVE_SKI "srx bgpsec active %u%s"
+#define SRX_VTY_HLP_BGPSEC_ACTIVE_SKI SRX_VTY_HLP_STR SRX_VTY_HLP_BGPSEC \
+                                      "Configure which key is active"
+
+#define SRX_VTY_CMD_BGPSEC_REGISTER_P_KEYS "srx bgpsec register keys"
+#define SRX_VTY_HLP_BGPSEC_REGISTER_P_KEYS SRX_VTY_HLP_STR SRX_VTY_HLP_BGPSEC \
+                          "This command will attempt to register the current " \
+                          "keys. This migth be required if a previous " \
+                          "registration failed!\n"
+
+// DEPRECATED AND REMOVED KEY COMMANDS
+#define SRX_VTY_HLP_BGPSEC_DEP "Please use the replacement 'srx bgpsec ...'\n"
+#define SRX_VTY_CMD_BGPSEC_DEP_SKI_PRNT "bgpsec ski"
+#define SRX_VTY_CMD_BGPSEC_DEP_SKI SRX_VTY_CMD_BGPSEC_DEP_SKI_PRNT " WORD"
+#define SRX_VTY_HLP_BGPSEC_DEP_SKI SRX_VTY_HLP_BGPSEC_DEP \
+                                   "This command is deprecated! " \
+                                   "Use '" SRX_VTY_CMD_BGPSEC_SKI_PRNT \
+                                   " <ski>' instead!\n"
+
+#define SRX_VTY_CMD_BGPSEC_DEP_SIGN "bgpsec sign (key|id)"
+#define SRX_VTY_HLP_BGPSEC_DEP_SIGN SRX_VTY_HLP_BGPSEC_DEP \
+                                    "This command is removed!\n"
+
+// BGPSEC NEIGHBOR COMMANDS
+#define SRX_VTY_CMD_NEIGHBOR_BGPSEC NEIGHBOR_CMD2 "bgpsec "
+#define SRX_VTY_HLP_NEIGHBOR_BGPSEC NEIGHBOR_STR NEIGHBOR_ADDR_STR2 \
+                                    "Configure the bgpsec capability to the peer\n"
+
+#define SRX_VTY_CMD_NEIGHBOR_BGPSEC_MODE SRX_VTY_CMD_NEIGHBOR_BGPSEC \
+                                    "(snd|rec|both)"
+//                                    "(snd|rec|both|migrate|route-server)"
+#define SRX_VTY_HLP_NEIGHBOR_BGPSEC_MODE SRX_VTY_HLP_NEIGHBOR_BGPSEC \
+                                    "Send BGPSEC but receive BGP4 only\n" \
+                                    "Receive BGPSEC but send BGP4 only\n" \
+                                    "Send BGPSEC and receive BGPSEC\n"
+//                                    "Flag this peering session as a migration." \
+//                                    " This will cause the pCount set to be 0.\n" \
+//                                    "Flag that the peer is a route server and " \
+//                                    "this peer is allowed to set its pcount to zero.\n"
+
+#define SRX_VTY_CMD_NO_NEIGHBOR_BGPSEC_MODE NO_NEIGHBOR_CMD2 "bgpsec " \
+                                    "(snd|rec|both)"
+//                                    "(snd|rec|both|migrate|route-server)"
+#define SRX_VTY_HLP_NO_NEIGHBOR_BGPSEC_MODE NO_STR SRX_VTY_HLP_NEIGHBOR_BGPSEC \
+                                    "Send BGPSEC but receive BGP4 only\n" \
+                                    "Receive BGPSEC but send BGP4 only\n" \
+                                    "Send BGPSEC and receive BGPSEC\n"
+//                                    "Remove the migration flag. This will remove" \
+//                                      " the acceptance of received" \
+//                                      " pcount=0 values of this peer and pcount" \
+//                                      " will not be set while" \
+//                                      " sending updates to this peer.\n" \
+//                                    "Unflag that the peer as a route server and" \
+//                                    " receiving pcount equals zero is not allowed.\n"
+
+#endif /* USE_SRX */
 /* Typedef BGP specific types.  */
 typedef u_int32_t as_t;
 typedef u_int16_t as16_t; /* we may still encounter 16 Bit asnums */
@@ -62,6 +365,20 @@ struct bgp_master
 #define BGP_OPT_NO_LISTEN                (1 << 3)
 };
 
+#ifdef USE_SRX
+/** Data stored in this structure defines how the local pref has to be
+ * manipulated.
+ */
+struct srx_local_pref {
+  // Indicated if the local pref has to be manipulated.
+  int      is_set;
+  // If set then add or delete the given value from the the local pref.
+  int      relative;
+  // the local pref value
+  uint32_t value;
+};
+#endif /* USE_SRX */
+
 /* BGP instance structure.  */
 struct bgp 
 {
@@ -91,6 +408,18 @@ struct bgp
 #define BGP_CONFIG_ROUTER_ID              (1 << 0)
 #define BGP_CONFIG_CLUSTER_ID             (1 << 1)
 #define BGP_CONFIG_CONFEDERATION          (1 << 2)
+#ifdef USE_SRX
+#define BGP_CONFIG_SRX                    (1 << 3)
+
+  /* SRX Configuration */
+  u_int16_t srx_config;
+#define SRX_CONFIG_EVAL_ORIGIN   (1 << 1)
+// Below must be set in combination with VALORIGIN
+#define SRX_CONFIG_EVAL_PATH     (1 << 2)
+#define SRX_CONFIG_EVALUATE      (SRX_CONFIG_EVAL_ORIGIN | SRX_CONFIG_EVAL_PATH)
+
+#define SRX_CONFIG_DISPLAY_INFO  (1 << 3)
+#endif /* USE_SRX */
 
   /* BGP router identifier.  */
   struct in_addr router_id;
@@ -173,6 +502,58 @@ struct bgp
     u_int16_t maxpaths_ebgp;
     u_int16_t maxpaths_ibgp;
   } maxpaths[AFI_MAX][SAFI_MAX];
+
+#ifdef USE_SRX
+  /* Configuration */
+  // All the default configuration is set in the method srx_set_default
+
+  char *srx_host;
+  int  srx_port;
+#define SRX_HANDHAKE_TIMEOUT  30
+#define SRX_KEEP_WINDOW      900
+
+  // The timeout during the session establishment
+  int  srx_handshakeTimeout;
+  // Time in seconds the SRx server is requested to keep data after a delete
+  int  srx_keepWindow;
+  uint32_t srx_proxyID;
+  /** The local pref values for [0]valid, [1]notfound, and [2]invalid*/
+  struct srx_local_pref  srx_val_local_pref[3];
+#define VAL_LOCPRF_VALID     0
+#define VAL_LOCPRF_NOTFOUND   1
+#define VAL_LOCPRF_INVALID   2
+
+  /** Contains the bit coded policy setting*/
+  uint16_t srx_val_policy;
+#define SRX_VAL_POLICY_PREFER_VALID     (1 << 0)
+#define SRX_VAL_POLICY_IGNORE_NOTFOUND  (1 << 1)
+#define SRX_VAL_POLICY_IGNORE_INVALID   (1 << 2)
+#define SRX_VAL_POLICY_IGNORE_UNDEFINED (1 << 3)
+
+  uint16_t srx_default_roaVal;
+  uint16_t srx_default_bgpsecVal;
+
+  /* Instance variables */
+  SRxProxy* srxProxy;
+  /* The info hash for update id's */
+  struct bgp_info_hash* info_uid_hash;
+  /* The info hash for local id's */
+  struct bgp_info_hash* info_lid_hash;
+  /** The SRx CryptoAPI instance. Will be currently maintained as g_capi in 
+   * bgp_validate.c */
+  SRxCryptoAPI* srxCAPI;
+
+  /* The bgpsec private key array. */
+  BGPSecKey srx_bgpsec_key[SRX_MAX_PRIVKEYS];
+  /** The key to be used, 0..SRX_MAX_PRIVKEYS-1.*/
+  u_int8_t  srx_bgpsec_active_key;
+
+  /** Contains the information if extended community is used and the subcode*/
+#define SRX_BGP_FLAG_ECOMMUNITY      (1 << 0)
+#define SRX_BGP_FLAG_ECOMMUNITY_EBGP (1 << 1)
+  u_int8_t srx_ecommunity_flags;
+  u_int8_t srx_ecommunity_subcode;
+#endif /* USE_SRX */
 };
 
 /* BGP peer-group support. */
@@ -370,6 +751,10 @@ struct peer
 #define PEER_CAP_AS4_RCV                    (1 << 8) /* as4 received */
 #define PEER_CAP_RESTART_BIT_ADV            (1 << 9) /* sent restart state */
 #define PEER_CAP_RESTART_BIT_RCV            (1 << 10) /* peer restart state */
+#ifdef USE_SRX
+#define PEER_CAP_BGPSEC_ADV_SEND            (1 << 14)/* bgpsec advertised send capability */
+#define PEER_CAP_BGPSEC_ADV                 (1 << 15)/* bgpsec advertised recv capability */
+#endif
 
   /* Capability flags (reset in bgp_stop) */
   u_int16_t af_cap[AFI_MAX][SAFI_MAX];
@@ -393,6 +778,15 @@ struct peer
 #define PEER_FLAG_DISABLE_CONNECTED_CHECK   (1 << 6) /* disable-connected-check */
 #define PEER_FLAG_LOCAL_AS_NO_PREPEND       (1 << 7) /* local-as no-prepend */
 #define PEER_FLAG_LOCAL_AS_REPLACE_AS       (1 << 8) /* local-as no-prepend replace-as */
+#ifdef USE_SRX
+#define PEER_FLAG_BGPSEC_MPE_IPV4           (1 << 10) /* mp extension for ipv4 */
+// The next two flags allow pcount=0, both in receiving and migrate also in sending
+#define PEER_FLAG_BGPSEC_MIGRATE            (1 << 11) /* enable migration mode with this peer */
+#define PEER_FLAG_BGPSEC_ROUTE_SERVER       (1 << 12) /* the peer is a route server */
+#define PEER_FLAG_BGPSEC_CAPABILITY_RECV    (1 << 14)/* bgpsec capability - RECV */
+#define PEER_FLAG_BGPSEC_CAPABILITY_SEND    (1 << 15)/* bgpsec capability - SEND */
+#define PEER_FLAG_BGPSEC_CAPABILITY         (1 << 15)/* bgpsec capability - SEND */
+#endif
 
   /* NSF mode (graceful restart) */
   u_char nsf[AFI_MAX][SAFI_MAX];
@@ -524,6 +918,12 @@ struct peer
 
   /* ORF Prefix-list */
   struct prefix_list *orf_plist[AFI_MAX][SAFI_MAX];
+  
+#ifdef USE_SRX
+  // Flag this peer to be migrated. In this case set the pCount to zero and
+  // also allow this peer to set its pCount to zero.
+  bool bgpsec_migrate;  
+#endif
 
   /* Prefix count. */
   unsigned long pcount[AFI_MAX][SAFI_MAX];
@@ -647,6 +1047,10 @@ struct bgp_nlri
 #define BGP_ATTR_AS4_AGGREGATOR                 18
 #define BGP_ATTR_AS_PATHLIMIT                   21
 #define BGP_ATTR_ENCAP                          23
+#ifdef USE_SRX
+//#define BGP_ATTR_BGPSEC                         11
+#define BGP_ATTR_BGPSEC                         30
+#endif
 
 /* BGP update origin.  */
 #define BGP_ORIGIN_IGP                           0
@@ -680,7 +1084,10 @@ struct bgp_nlri
 #define BGP_NOTIFY_OPEN_AUTH_FAILURE             5
 #define BGP_NOTIFY_OPEN_UNACEP_HOLDTIME          6
 #define BGP_NOTIFY_OPEN_UNSUP_CAPBL              7
-#define BGP_NOTIFY_OPEN_MAX                      8
+#ifdef USE_SRX
+#define BGP_NOTIFY_OPEN_UNSUP_BGPSEC             8
+#endif
+#define BGP_NOTIFY_OPEN_MAX                      9
 
 /* BGP_NOTIFY_UPDATE_ERR sub codes.  */
 #define BGP_NOTIFY_UPDATE_MAL_ATTR               1
@@ -901,6 +1308,32 @@ extern int bgp_timers_unset (struct bgp *);
 
 extern int bgp_default_local_preference_set (struct bgp *, u_int32_t);
 extern int bgp_default_local_preference_unset (struct bgp *);
+
+#ifdef USE_SRX
+extern int bgp_srx_set (struct bgp *, struct vty *, const char *, int, bool);
+extern int bgp_srx_unset (struct bgp *bgp);
+
+// does both, set and unset
+extern int bgp_srx_evaluation (struct bgp *, int);
+extern int bgp_srx_display (struct bgp *bgp, int);
+extern int bgp_srx_conf_default_result (struct bgp *bgp, int, int);
+
+// does set
+extern int srx_set_proxyID(struct bgp* , uint32_t);
+
+extern int srx_val_local_preference_set (struct bgp *, int, int, uint32_t);
+extern int srx_val_local_preference_unset (struct bgp *, int);
+extern int srx_val_policy_set (struct bgp *, uint16_t);
+extern int srx_val_policy_unset (struct bgp *, uint16_t);
+
+extern int srx_extcommunity_set (struct bgp *, uint8_t, const char *);
+extern int srx_extcommunity_unset (struct bgp *);
+
+extern int srx_config_check (struct bgp *, uint16_t);
+
+extern int srx_connect_proxy(struct bgp *);
+#define DEBUG_TEST
+#endif /* USE_SRX */
 
 extern int peer_rsclient_active (struct peer *);
 

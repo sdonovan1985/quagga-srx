@@ -107,4 +107,7 @@ extern unsigned int aspath_has_as4 (struct aspath *);
 /* For SNMP BGP4PATHATTRASPATHSEGMENT, might be useful for debug */
 extern u_char *aspath_snmp_pathseg (struct aspath *, size_t *);
 
+#ifdef USE_SRX
+extern as_t aspath_origin_as (struct aspath *);
+#endif /* USE_SRX */
 #endif /* _QUAGGA_BGP_ASPATH_H */
