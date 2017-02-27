@@ -6328,12 +6328,12 @@ bgp_config_write (struct vty *vty)
         }
         if (kIdx == 0)
         {
-          vty_out (vty, "! The following form is deprecated.", VTY_NEWLINE);
+          vty_out (vty, "! The following form is deprecated.%s", VTY_NEWLINE);
           vty_out (vty, "! bgpsec ski %s%s", skiStr, VTY_NEWLINE);
         }
-        vty_out (vty, " srx bgpsec ski%u %s%s", kIdx, skiStr, VTY_NEWLINE);
+        vty_out (vty, " srx bgpsec ski%u %s%s%s", kIdx, skiStr, VTY_NEWLINE);
       }
-      vty_out (vty, " srx bgpsec active-ski %u%s", bgp->srx_bgpsec_active_key, 
+      vty_out (vty, " srx bgpsec active-ski %u%s%s", bgp->srx_bgpsec_active_key, 
                VTY_NEWLINE);
 #endif /* USE_SRX */
 
