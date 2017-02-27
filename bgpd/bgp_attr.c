@@ -3445,6 +3445,7 @@ bgp_packet_attribute (struct bgp *bgp, struct peer *peer,
       stream_putc (s, 8);
       stream_putl (s, attr->extra->aggregator_as);
       stream_put_ipv4 (s, attr->extra->aggregator_addr.s_addr);
+    }
     
 #ifdef USE_SRX
   if (!(*useASpath))
@@ -3494,13 +3495,15 @@ bgp_packet_attribute (struct bgp *bgp, struct peer *peer,
   {
     // Construct a good old AS_PATH attribute
 #endif // USE_SRX
+
+
+#ifdef USE_SRX  //SPD change
     stream_putc (s, BGP_ATTR_FLAG_TRANS|BGP_ATTR_FLAG_EXTLEN);
     stream_putc (s, BGP_ATTR_AS_PATH);
     aspath_sizep = stream_get_endp (s);
     stream_putw (s, 0);
     stream_putw_at (s, aspath_sizep, aspath_put (s, aspath_bgpsec, use32bit));
     
-#ifdef USE_SRX
   }
     
   /* release aspath pointer used for bgpsec */

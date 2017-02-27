@@ -179,12 +179,17 @@ extern struct attr *bgp_attr_aggregate_intern (struct bgp *, u_char,
 #ifdef USE_SRX
 // Added the OUT parameter fSetAspath which will be returned true if the
 // path was send as AS_PATH and false if the path was send as BGPSEC path.
-#endif
 extern bgp_size_t bgp_packet_attribute (struct bgp *bgp, struct peer *,
 					struct stream *, struct attr *,
 					struct prefix *, afi_t, safi_t,
 					struct peer *, struct prefix_rd *,
 					u_char *, bool* fSetAspath);
+#endif
+extern bgp_size_t bgp_packet_attribute (struct bgp *bgp, struct peer *,
+					struct stream *, struct attr *,
+					struct prefix *, afi_t, safi_t,
+					struct peer *, struct prefix_rd *,
+					u_char *);
 extern void bgp_dump_routes_attr (struct stream *, struct attr *,
 				  struct prefix *);
 extern int attrhash_cmp (const void *, const void *);

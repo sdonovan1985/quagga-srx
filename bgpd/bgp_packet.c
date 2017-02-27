@@ -299,7 +299,7 @@ bgp_update_packet (struct peer *peer, afi_t afi, safi_t safi)
 											 afi, safi,
                                              from, prd, tag);
 #endif
-      stream_putw_at (s, pos, total_attr_len);
+      stream_putw_at (s, mpattr_pos, total_attr_len);
 #ifdef USE_SRX
       if (CHECK_FLAG (peer->bgp->srx_ecommunity_flags,  SRX_BGP_FLAG_ECOMMUNITY))
         bFrag = srxEcommunityRestore(adv->baa->attr, ecom_orig);
@@ -449,7 +449,6 @@ donot_frag:
 	  bgp_packet_mpattr_end(snlri, mpattrlen_pos);
 	  total_attr_len += stream_get_endp(snlri);
 	}
-    }//FIXME: should this be here?
       /* set the total attribute length correctly */
       stream_putw_at (s, attrlen_pos, total_attr_len);
 
