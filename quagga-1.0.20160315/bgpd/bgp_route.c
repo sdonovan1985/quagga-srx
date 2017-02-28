@@ -7174,6 +7174,8 @@ route_vty_out(
       else
 
 #ifdef USE_SRX
+	vty_out (vty, "          ");
+
       // Determine srx policy local pref
       struct bgp* bgp = binfo->peer->bgp;
       int srxResult = srx_calc_validation_state(bgp, binfo);
