@@ -141,7 +141,7 @@ void bgpsec_path_attr_init()
  //        One exception though, if we keep signing here even with the use of 
  //        srx-server.
   // aspath_init initialize its aspath hash as many as the number of 32767 hashes, so follows the same number
-  bgpsechash = hash_create_size (32767, bgpsec_path_attr_key_make, bgpsec_path_attr_cmp);
+  bgpsechash = hash_create_size (32768, bgpsec_path_attr_key_make, bgpsec_path_attr_cmp);
   g_capi = malloc(sizeof(SRxCryptoAPI));
   memset (g_capi, 0, sizeof(SRxCryptoAPI));
   sca_status_t sca_status = API_STATUS_OK;
@@ -1327,3 +1327,4 @@ void freeSCA_HashMessage(SCA_HashMessage* message)
 
 
 #endif /* USE_SRX */
+

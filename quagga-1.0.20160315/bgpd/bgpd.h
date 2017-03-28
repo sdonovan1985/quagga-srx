@@ -63,7 +63,7 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 #define SRX_VTY_CMD_CONNECT_SHORT "srx connect"
 #define SRX_VTY_HLP_CONNECT_SHORT SRX_VTY_HLP_STR \
                                   "Connect the router with SRx server\n"
-#define SRX_VTY_CMD_CONNECT   SRX_VTY_CMD_CONNECT_SHORT " .LINE <0-65535>"
+#define SRX_VTY_CMD_CONNECT   SRX_VTY_CMD_CONNECT_SHORT " A.B.C.D <0-65535>"
 #define SRX_VTY_OUT_CONNECT   "srx connect %s %d%s"
 #define SRX_VTY_HLP_CONNECT   SRX_VTY_HLP_CONNECT_SHORT \
                               "Specifies SRx server host name or IP address\n" \
@@ -105,7 +105,7 @@ Software Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA
 
 //The short version is not a stand alone command, it is needed for a vtty output
 #define SRX_VTY_CMD_SET_SERVER_SHORT "srx set-server"
-#define SRX_VTY_CMD_SET_SERVER  SRX_VTY_CMD_SET_SERVER_SHORT " .LINE <0-65535>"
+#define SRX_VTY_CMD_SET_SERVER  SRX_VTY_CMD_SET_SERVER_SHORT " A.B.C.D <0-65535>"
 #define SRX_VTY_HLP_SET_SERVER  SRX_VTY_HLP_STR \
                                 "Set the SRx server connection parameters\n"
 
@@ -603,7 +603,7 @@ struct bgp_rd
 #define RMAP_IMPORT   2
 #define RMAP_EXPORT   3
 #define RMAP_MAX        4
-
+#define FILTER_MAX	2
 /* BGP filter structure. */
 struct bgp_filter
 {
@@ -1424,3 +1424,5 @@ extern int peer_ttl_security_hops_set (struct peer *, int);
 extern int peer_ttl_security_hops_unset (struct peer *);
 
 #endif /* _QUAGGA_BGPD_H */
+
+

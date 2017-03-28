@@ -91,7 +91,9 @@ am_libbgp_a_OBJECTS = bgpd.$(OBJEXT) bgp_fsm.$(OBJEXT) \
 	bgp_mplsvpn.$(OBJEXT) bgp_nexthop.$(OBJEXT) bgp_damp.$(OBJEXT) \
 	bgp_table.$(OBJEXT) bgp_advertise.$(OBJEXT) bgp_vty.$(OBJEXT) \
 	bgp_mpath.$(OBJEXT) bgp_encap.$(OBJEXT) \
-	bgp_encap_tlv.$(OBJEXT)
+	bgp_encap_tlv.$(OBJEXT) \
+	bgp_info_hash.$(OBJEXT) \
+	bgp_validate.$(OBJEXT) 
 libbgp_a_OBJECTS = $(am_libbgp_a_OBJECTS)
 am__installdirs = "$(DESTDIR)$(bindir)" "$(DESTDIR)$(sbindir)" \
 	"$(DESTDIR)$(examplesdir)"
@@ -334,7 +336,7 @@ target_vendor = @target_vendor@
 top_build_prefix = @top_build_prefix@
 top_builddir = @top_builddir@
 top_srcdir = @top_srcdir@
-AM_CPPFLAGS = -I.. -I$(top_srcdir) -I$(top_srcdir)/lib -I$(top_builddir)/lib
+AM_CPPFLAGS = -I.. -I$(top_srcdir) -I$(top_srcdir)/lib -I$(top_builddir)/lib 
 INSTALL_SDATA = @INSTALL@ -m 600
 AM_CFLAGS = $(WERROR)
 noinst_LIBRARIES = libbgp.a
@@ -344,7 +346,7 @@ libbgp_a_SOURCES = \
 	bgp_packet.c bgp_network.c bgp_filter.c bgp_regex.c bgp_clist.c \
 	bgp_dump.c bgp_snmp.c bgp_ecommunity.c bgp_mplsvpn.c bgp_nexthop.c \
 	bgp_damp.c bgp_table.c bgp_advertise.c bgp_vty.c bgp_mpath.c \
-	bgp_encap.c bgp_encap_tlv.c
+	bgp_encap.c bgp_encap_tlv.c bgp_info_hash.c bgp_validate.c
 
 noinst_HEADERS = \
 	bgp_aspath.h bgp_attr.h bgp_community.h bgp_debug.h bgp_fsm.h \
@@ -352,7 +354,8 @@ noinst_HEADERS = \
 	bgpd.h bgp_filter.h bgp_clist.h bgp_dump.h bgp_zebra.h \
 	bgp_ecommunity.h bgp_mplsvpn.h bgp_nexthop.h bgp_damp.h bgp_table.h \
 	bgp_advertise.h bgp_snmp.h bgp_vty.h bgp_mpath.h \
-	bgp_encap.h bgp_encap_tlv.h bgp_encap_types.h
+	bgp_encap.h bgp_encap_tlv.h bgp_encap_types.h \
+	bgp_info_hash.h bgp_validate.h
 
 bgpd_SOURCES = bgp_main.c
 bgpd_LDADD = libbgp.a ../lib/libzebra.la @LIBCAP@ @LIBM@
@@ -799,3 +802,4 @@ uninstall-am: uninstall-binPROGRAMS uninstall-dist_examplesDATA \
 # Tell versions [3.59,3.63) of GNU make to not export all variables.
 # Otherwise a system limit (for SysV at least) may be exceeded.
 .NOEXPORT:
+
